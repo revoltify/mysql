@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+. /usr/local/lib/mysql-cluster/topology.sh
+
+drop_privileges "$0" "$@"
+
+[ "$#" -ge 1 ] || fail "usage: cluster-admin <javascript>, e.g. cluster-admin 'print(dba.getCluster().status())'"
+cluster_shell "$MYSQL_PRIVATE_IP" "$*"

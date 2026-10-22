@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+
+drop_privileges "$0" "$@"
+
+write_root_client_config
+exec mysql --defaults-extra-file="$ROOT_CLIENT_CONFIG" "$@"

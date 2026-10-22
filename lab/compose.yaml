@@ -1,0 +1,74 @@
+name: mysql-lab
+
+x-mysql: &mysql
+  image: ${LAB_IMAGE:-mysql-cluster:dev}
+  restart: unless-stopped
+  env_file: node.env
+  mem_limit: 768m
+  stop_grace_period: 120s
+
+x-router: &router
+  image: ${LAB_IMAGE:-mysql-cluster:dev}
+  restart: unless-stopped
+  env_file: node.env
+  entrypoint: [/usr/local/bin/tini, --, router]
+  healthcheck:
+    disable: true
+
+services:
+  s3:
+    image: versity/versitygw:v1.9.0@sha256:eb7f786fcd91e72194e48fcf1ac16302d686bf8e3a71434bdbc067a6efd3fdc7
+    entrypoint: [sh, -c, "mkdir -p /data/backups && exec versitygw --access labaccess --secret labsecretlabsecret --port :9000 posix /data"]
+    networks:
+      lab:
+        ipv4_address: 10.77.0.5
+
+  mysql-1:
+    <<: *mysql
+    environment: { MYSQL_PRIVATE_IP: 10.77.0.11, CLUSTER_SEED: "true" }
+    volumes: [data-1:/var/lib/mysql]
+    networks: { lab: { ipv4_address: 10.77.0.11 } }
+
+  mysql-2:
+    <<: *mysql
+    environment: { MYSQL_PRIVATE_IP: 10.77.0.12 }
+    volumes: [data-2:/var/lib/mysql]
+    networks: { lab: { ipv4_address: 10.77.0.12 } }
+
+  mysql-3:
+    <<: *mysql
+    environment: { MYSQL_PRIVATE_IP: 10.77.0.13 }
+    volumes: [data-3:/var/lib/mysql]
+    networks: { lab: { ipv4_address: 10.77.0.13 } }
+
+  router-1:
+    <<: *router
+    environment: { MYSQL_PRIVATE_IP: 10.77.0.11 }
+    network_mode: service:mysql-1
+    volumes: [router-1:/router, ./tls:/tls:ro]
+
+  router-2:
+    <<: *router
+    environment: { MYSQL_PRIVATE_IP: 10.77.0.12 }
+    network_mode: service:mysql-2
+    volumes: [router-2:/router, ./tls:/tls:ro]
+
+  router-3:
+    <<: *router
+    environment: { MYSQL_PRIVATE_IP: 10.77.0.13 }
+    network_mode: service:mysql-3
+    volumes: [router-3:/router, ./tls:/tls:ro]
+
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+
+volumes:
+  data-1:
+  data-2:
+  data-3:
+  router-1:
+  router-2:
+  router-3:

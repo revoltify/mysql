@@ -1,0 +1,165 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+. /usr/local/lib/mysql-cluster/topology.sh
+
+RECONCILE_INTERVAL_SECONDS=10
+BOOT_GRACE_SECONDS=60
+OUTAGE_GRACE_SECONDS=60
+
+drop_privileges "$0" "$@"
+
+last_note=
+note() {
+    [ "$*" = "$last_note" ] && return 0
+    last_note=$*
+    log "$*"
+}
+
+own_uuid() {
+    sql -e 'SELECT @@server_uuid'
+}
+
+own_state() {
+    sql -e 'SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid'
+}
+
+in_group() {
+    case "$(own_state)" in
+        ONLINE | RECOVERING) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+self_address() {
+    instance_address "$MYSQL_PRIVATE_IP"
+}
+
+listed_by() {
+    [ "$(peer_sql "$1" "SELECT COUNT(*) FROM $METADATA_SCHEMA.instances WHERE mysql_server_uuid = '$(own_uuid)'")" = "1" ]
+}
+
+address_listed_by() {
+    [ "$(peer_sql "$1" "SELECT COUNT(*) FROM $METADATA_SCHEMA.instances WHERE address = '$(self_address)'")" = "1" ]
+}
+
+forget_stale_entry_on() {
+    address_listed_by "$1" || return 0
+    log "removing the stale metadata entry for $(self_address) left by a previous data directory"
+    cluster_shell "$1" "dba.getCluster().removeInstance('$(self_address)', {force: true})"
+}
+
+join_through() {
+    if listed_by "$1"; then
+        log "rejoining the cluster through primary $1"
+        cluster_shell "$1" "dba.getCluster().rejoinInstance('$(self_address)')"
+        return
+    fi
+    forget_stale_entry_on "$1"
+    log "joining the cluster through primary $1, cloning its data"
+    cluster_shell "$1" "dba.getCluster().addInstance('$(self_address)', {recoveryMethod: 'clone', recoveryProgress: 1})"
+}
+
+recorded_members() {
+    sql -e "SELECT SUBSTRING_INDEX(address, ':', 1) FROM $METADATA_SCHEMA.instances ORDER BY address"
+}
+
+gtid_executed_on() {
+    peer_sql "$1" "SELECT REPLACE(@@gtid_executed, '\n', '')"
+}
+
+gtid_subset() {
+    [ "$(sql -e "SELECT GTID_SUBSET('$1', '$2')")" = "1" ]
+}
+
+reachable_members_with_gtids() {
+    for host in $(recorded_members); do
+        gtids=$(gtid_executed_on "$host") || continue
+        membership_recorded_on "$host" && printf '%s %s\n' "$host" "$gtids"
+    done
+    return 0
+}
+
+contains_all() {
+    while read -r _ other; do
+        gtid_subset "$other" "$1" || return 1
+    done < "$2"
+}
+
+gtids_of() {
+    awk -v host="$1" '$1 == host { print $2 }' "$2"
+}
+
+most_advanced_member() {
+    hosts=$(cut -d ' ' -f 1 "$1")
+    for host in $hosts; do
+        contains_all "$(gtids_of "$host" "$1")" "$1" && { printf '%s' "$host"; return 0; }
+    done
+    return 1
+}
+
+outage_started_at=
+outage_age() {
+    [ -n "$outage_started_at" ] || outage_started_at=$(date +%s)
+    printf '%s' "$(($(date +%s) - outage_started_at))"
+}
+
+reboot_cluster() {
+    log "every member is offline, rebooting the cluster from this member (most transactions; force=$1)"
+    cluster_shell "$MYSQL_PRIVATE_IP" "dba.rebootClusterFromCompleteOutage('$CLUSTER_NAME', {force: $1})"
+}
+
+recover_from_outage() {
+    members=$(recorded_members | wc -l | tr -d ' ')
+    candidates=/tmp/cluster-agent-candidates
+    reachable_members_with_gtids > "$candidates"
+    count=$(wc -l < "$candidates" | tr -d ' ')
+    [ "$count" -ge "$(majority_of "$members")" ] || { note "no primary online and only $count of $members members reachable, waiting for a majority"; return 0; }
+    [ "$count" -eq "$members" ] || [ "$(outage_age)" -ge "$OUTAGE_GRACE_SECONDS" ] || { note "no primary online, waiting up to ${OUTAGE_GRACE_SECONDS}s for all $members members"; return 0; }
+    leader=$(most_advanced_member "$candidates") || { note "ERROR: no member holds every transaction of the others (diverged), resolve by hand"; return 1; }
+    [ "$leader" = "$MYSQL_PRIVATE_IP" ] || { note "no primary online, waiting for $leader (most transactions) to reboot the cluster"; return 0; }
+    force=false
+    [ "$count" -eq "$members" ] || force=true
+    reboot_cluster "$force"
+}
+
+create_cluster() {
+    if metadata_present_on "$MYSQL_PRIVATE_IP"; then
+        log "dropping cluster metadata restored from a backup of another cluster"
+        cluster_shell "$MYSQL_PRIVATE_IP" "dba.dropMetadataSchema({force: true, clearReadOnly: true})"
+    fi
+    log "creating cluster $CLUSTER_NAME with this member as primary"
+    cluster_shell "$MYSQL_PRIVATE_IP" "dba.createCluster('$CLUSTER_NAME', {memberSslMode: 'REQUIRED', expelTimeout: 0})"
+}
+
+start_cluster_if_seed() {
+    [ "$CLUSTER_SEED" = "true" ] || { note "waiting for a primary to join"; return 0; }
+    no_reachable_peer_has_metadata || { note "peers hold cluster metadata, waiting for them to come online"; return 0; }
+    create_cluster
+}
+
+reconcile() {
+    in_group && { outage_started_at=; note "member is $(own_state)"; return 0; }
+    if primary=$(online_primary); then
+        outage_started_at=
+        join_through "$primary"
+        return
+    fi
+    if membership_recorded_on "$MYSQL_PRIVATE_IP"; then
+        recover_from_outage
+        return
+    fi
+    start_cluster_if_seed
+}
+
+main() {
+    validate_topology_env
+    membership_recorded_on "$MYSQL_PRIVATE_IP" && sleep "$BOOT_GRACE_SECONDS"
+    while true; do
+        reconcile || log "ERROR: reconcile failed, retrying in ${RECONCILE_INTERVAL_SECONDS}s"
+        sleep "$RECONCILE_INTERVAL_SECONDS"
+    done
+}
+
+main

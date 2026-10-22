@@ -1,0 +1,66 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+. /usr/local/lib/mysql-cluster/topology.sh
+
+LOCK_FILE="$BACKUP_TMP_DIR/backup.lock"
+SYSTEM_SCHEMAS="'mysql', 'sys', 'performance_schema', 'information_schema', '$METADATA_SCHEMA'"
+
+drop_privileges "$0" "$@"
+
+acquire_lock() {
+    exec 9> "$LOCK_FILE"
+    flock -n 9 || fail "another backup is already running"
+}
+
+backup_member() {
+    sql -e "SELECT MEMBER_HOST FROM performance_schema.replication_group_members
+        WHERE MEMBER_STATE = 'ONLINE' ORDER BY MEMBER_ROLE = 'PRIMARY', MEMBER_HOST LIMIT 1"
+}
+
+user_tables() {
+    sql -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ($SYSTEM_SCHEMAS)"
+}
+
+stream_backup_to() {
+    xtrabackup --defaults-extra-file="$ROOT_CLIENT_CONFIG" --backup --stream=xbstream --target-dir="$workdir/stream" \
+        2> "$workdir/xtrabackup.log" | zstd -q -T0 -3 > "$1"
+    tail -n 1 "$workdir/xtrabackup.log" | grep -q 'completed OK!' \
+        || fail "xtrabackup failed: $(tail -n 3 "$workdir/xtrabackup.log" | tr '\n' ' ')"
+}
+
+all_but_newest() {
+    awk -v keep="$1" '{ names[NR] = $0 } END { for (i = 1; i <= NR - keep; i++) print names[i] }'
+}
+
+prune_old_backups() {
+    backups=$(backup_names) || fail "cannot list backups for pruning"
+    for name in $(printf '%s\n' "$backups" | all_but_newest "$BACKUP_RETENTION"); do
+        s3_delete "$name" || fail "could not delete $name"
+        log "pruned $name"
+    done
+}
+
+main() {
+    validate_backup_env
+    [ "$(backup_member)" = "$MYSQL_PRIVATE_IP" ] || { log "another member takes the backups, skipping"; return 0; }
+    acquire_lock
+
+    tables=$(user_tables)
+    if [ "$tables" -eq 0 ]; then
+        log "no user tables yet, skipping upload so existing backups are kept"
+        return 0
+    fi
+
+    name="backup-$(date -u +%Y%m%dT%H%M%SZ).xbstream.zst"
+    workdir=$(mktemp -d "$BACKUP_TMP_DIR/backup.XXXXXX")
+    trap 'rm -rf "$workdir"' EXIT
+
+    stream_backup_to "$workdir/$name"
+    s3_upload "$workdir/$name" "$name" || fail "upload of $name failed"
+    log "uploaded $name ($(du -h "$workdir/$name" | cut -f 1), $tables tables)"
+    prune_old_backups
+}
+
+main

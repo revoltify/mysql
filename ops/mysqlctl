@@ -1,0 +1,1442 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MYSQLCTL_REF=main
+GITHUB_REPO=revoltify/mysql
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+REPO_DIR=$(dirname "$(dirname "$SCRIPT_PATH")")
+STATE_DIR=${MYSQLCTL_HOME:-$HOME/.mysqlctl}
+CLUSTERS_DIR=${MYSQLCTL_CLUSTERS_DIR:-$STATE_DIR/clusters}
+DEFAULT_IMAGE=ghcr.io/revoltify/mysql:latest
+REMOTE_DIR=/srv/mysql
+ROUTER_PORT=6446
+NODE_ENV_PASSTHROUGH='^(S3_[A-Z_]+|BACKUP_[A-Z_]+|RESTORE_[A-Z_]+|ACME_[A-Z_]+|CF_DNS_API_TOKEN|MYSQL_BUFFER_POOL_PERCENT|MYSQL_BUFFER_POOL_SIZE|MYSQL_CONFIG_[A-Z0-9_]+)$'
+ACME_WAIT_SECONDS=240
+JOIN_WAIT_SECONDS=900
+IPV4='([0-9]{1,3}\.){3}[0-9]{1,3}'
+FAILOVER_TEST_SETTLE_SECONDS=10
+FAILOVER_MINIMUM_NODES=3
+FAILOVER_TEST_SCHEMA=mysqlctl_failover_test
+
+YES=false
+CLUSTER=
+INVENTORY=
+TLS_LOCAL_DIR=
+EXIT_HOOKS=
+SCRATCH=
+ANSWER=
+INVENTORY_TEXT=
+
+usage() {
+    cat <<'EOF'
+usage: mysqlctl [--yes] <command> <cluster> [arguments]
+
+  init <cluster>                                   provision every node in the inventory and start the cluster
+                                                   (asks for mode, servers, TLS, database and backups when no inventory exists)
+  status <cluster>                                 member state, role, applier queue, containers and the TLS endpoint
+  add-node <cluster> <name> <public>/<private>     join a new member (cloned from the primary)
+  remove-node <cluster> <name>                     retire a secondary (keeps its data directory)
+  replace-node <cluster> <old> <new> <public>/<private>
+  failover <cluster> [node]                        switch the primary role to a secondary
+  upgrade <cluster> [tag]                          rolling image upgrade: secondaries, switchover, old primary
+  rotate-certs <cluster>                           reissue the server certificate from the local CA
+  test-failover <cluster>                          kill the primary under write load and measure the impact
+  backup-now <cluster>                             run the image's backup on the member that takes backups
+
+  domain <cluster>                                 serve a Let's Encrypt certificate for your domain (Cloudflare DNS)
+  list                                             clusters known on this machine
+  env <cluster>                                    Laravel .env lines (DB_* and the CA certificate when needed)
+  cli <cluster> [sql]                              run SQL on the primary (no SQL: interactive, or pipe a file)
+  ssh <cluster> [node]                             open a shell on a node (default: the first one)
+  version                                          installed version
+  self-update                                      install the latest mysqlctl from GitHub
+  uninstall [--purge]                              remove the mysqlctl command (--purge also deletes ~/.mysqlctl)
+
+State: ~/.mysqlctl/clusters/<cluster>.env and <cluster>-tls/ (override with MYSQLCTL_HOME).
+EOF
+}
+
+log() {
+    printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+on_exit() {
+    EXIT_HOOKS="$*; $EXIT_HOOKS"
+}
+
+run_exit_hooks() {
+    [ -n "$EXIT_HOOKS" ] || return 0
+    eval "$EXIT_HOOKS" || true
+}
+
+create_scratch_dir() {
+    SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/mysqlctl.XXXXXX")
+    on_exit "rm -rf '$SCRATCH'"
+}
+
+confirm() {
+    printf '\nPlan%s:\n' "${CLUSTER:+ for cluster $CLUSTER}" >&2
+    printf '  - %s\n' "$@" >&2
+    [ "$YES" = true ] && return 0
+    local answer
+    { : </dev/tty; } 2>/dev/null || die "no terminal to confirm on, rerun with --yes"
+    read -r -p 'Proceed? [y/N] ' answer </dev/tty || die "no terminal to confirm on, rerun with --yes"
+    case "$answer" in
+        y | Y | yes) ;;
+        *) die "aborted" ;;
+    esac
+}
+
+lock_cluster() {
+    local lock="$CLUSTERS_DIR/.$CLUSTER.lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        local holder
+        holder=$(cat "$lock/pid" 2>/dev/null || true)
+        [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null && die "cluster $CLUSTER is locked by mysqlctl pid $holder"
+        log "removing stale lock left by pid ${holder:-unknown}"
+        rm -rf "$lock"
+        mkdir "$lock"
+    fi
+    printf '%s\n' "$$" > "$lock/pid"
+    on_exit "rm -rf '$lock'"
+}
+
+wait_until() {
+    local description=$1 timeout=$2
+    shift 2
+    local deadline=$((SECONDS + timeout))
+    log "waiting for $description"
+    until "$@"; do
+        [ "$SECONDS" -lt "$deadline" ] || die "timed out after ${timeout}s waiting for $description"
+        sleep 3
+    done
+}
+
+require_local_tools() {
+    local tool
+    for tool in ssh awk sed paste openssl curl base64; do
+        command -v "$tool" >/dev/null || die "$tool is required on this machine"
+    done
+}
+
+select_cluster() {
+    [ -n "${1:-}" ] || { usage >&2; exit 2; }
+    [[ $1 =~ ^[A-Za-z0-9_-]+$ ]] || die "cluster name must be letters, digits, _ or -"
+    CLUSTER=$1
+    INVENTORY="$CLUSTERS_DIR/$CLUSTER.env"
+    TLS_LOCAL_DIR="$CLUSTERS_DIR/$CLUSTER-tls"
+}
+
+load_inventory() {
+    select_cluster "${1:-}"
+    [ -f "$INVENTORY" ] || die "no inventory at $INVENTORY, run: mysqlctl init $CLUSTER"
+    # shellcheck disable=SC1090
+    source "$INVENTORY"
+    SSH_USER=${SSH_USER:-root}
+    IMAGE=${IMAGE:-$DEFAULT_IMAGE}
+    TLS_NAMES=${TLS_NAMES:-}
+    NODES=${NODES:-}
+    DB_DATABASE=${DB_DATABASE:-laravel}
+    DB_USERNAME=${DB_USERNAME:-laravel}
+    [ -n "$NODES" ] || die "NODES is empty in $INVENTORY"
+    validate_nodes
+}
+
+validate_nodes() {
+    local entry
+    for entry in $NODES; do
+        validate_node_name "${entry%%=*}"
+        validate_address "${entry#*=}"
+    done
+    [ "$(node_names | sort -u | wc -l)" -eq "$(node_count)" ] || die "duplicate node names in NODES"
+    [ "$(private_ips | sort -u | wc -l)" -eq "$(node_count)" ] || die "duplicate private IPs in NODES"
+}
+
+valid_node_name() {
+    [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]]
+}
+
+valid_ipv4() {
+    [[ $1 =~ ^$IPV4$ ]]
+}
+
+validate_node_name() {
+    valid_node_name "$1" || die "node name '$1' must be lowercase letters, digits and -"
+}
+
+validate_address() {
+    [[ $1 =~ ^$IPV4/$IPV4$ ]] || die "node address '$1' must be <public-ip>/<private-ip>"
+}
+
+set_inventory_var() {
+    local name=$1 value=$2 tmp
+    tmp=$(mktemp "$INVENTORY.XXXXXX")
+    awk -v name="$name" -v line="$name=\"$value\"" '
+        index($0, name "=") == 1 { print line; written = 1; next }
+        { print }
+        END { if (!written) print line }
+    ' "$INVENTORY" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$INVENTORY"
+    printf -v "$name" '%s' "$value"
+}
+
+node_names() {
+    local entry
+    for entry in $NODES; do
+        printf '%s\n' "${entry%%=*}"
+    done
+}
+
+node_count() {
+    local entries
+    read -r -a entries <<<"$NODES"
+    printf '%s' "${#entries[@]}"
+}
+
+first_node() {
+    local entries
+    read -r -a entries <<<"$NODES"
+    printf '%s' "${entries[0]%%=*}"
+}
+
+has_node() {
+    node_names | grep -qx "$1"
+}
+
+address_of() {
+    local entry
+    for entry in $NODES; do
+        [ "${entry%%=*}" = "$1" ] && { printf '%s' "${entry#*=}"; return 0; }
+    done
+    die "unknown node $1"
+}
+
+public_ip_of() {
+    local address
+    address=$(address_of "$1")
+    printf '%s' "${address%%/*}"
+}
+
+private_ip_of() {
+    local address
+    address=$(address_of "$1")
+    printf '%s' "${address#*/}"
+}
+
+private_ips() {
+    local node
+    for node in $(node_names); do
+        printf '%s\n' "$(private_ip_of "$node")"
+    done
+}
+
+node_at() {
+    local node
+    for node in $(node_names); do
+        [ "$(private_ip_of "$node")" = "$1" ] && { printf '%s' "$node"; return 0; }
+    done
+    return 1
+}
+
+nodes_except() {
+    node_names | grep -vx "$1" || true
+}
+
+cluster_hosts_csv() {
+    private_ips | paste -sd , -
+}
+
+majority_of() {
+    printf '%s' "$(($1 / 2 + 1))"
+}
+
+nodes_without() {
+    local entry kept=
+    for entry in $NODES; do
+        [ "${entry%%=*}" = "$1" ] || kept="$kept $entry"
+    done
+    printf '%s' "${kept# }"
+}
+
+instance_of() {
+    printf '%s:3306' "$(private_ip_of "$1")"
+}
+
+ssh_to() {
+    local node=$1
+    shift
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+        "$SSH_USER@$(public_ip_of "$node")" "$@"
+}
+
+remote_prelude() {
+    cat <<'EOS'
+set -euo pipefail
+MYSQL_DIR=/srv/mysql
+TLS_DIR=$MYSQL_DIR/tls
+MYSQL_UID=999
+in_mysql() { docker exec mysql-mysql-1 "$@" </dev/null; }
+msql() { in_mysql sql -NB -e "$1"; }
+admin() { in_mysql cluster-admin "$1"; }
+compose() { (cd "$MYSQL_DIR" && docker compose "$@" </dev/null); }
+write_file() {
+    local path=$1 mode=$2 tmp
+    tmp=$(mktemp "$path.XXXXXX")
+    chmod "$mode" "$tmp"
+    printf '%s\n' "$3" > "$tmp"
+    mv "$tmp" "$path"
+}
+set_env_key() {
+    local file=$MYSQL_DIR/.env
+    if grep -q "^$1=" "$file"; then
+        sed -i "s|^$1=.*|$1=$2|" "$file"
+        return
+    fi
+    printf '%s=%s\n' "$1" "$2" >> "$file"
+}
+own_state() { msql "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid"; }
+image_in_use() {
+    docker inspect -f '{{.Config.Image}}' mysql-router-1 2>/dev/null && return
+    sed -n 's/^ *image: *//p' "$MYSQL_DIR/compose.yaml" | head -n 1
+}
+EOS
+}
+
+remote_variables() {
+    local pair
+    for pair in "$@"; do
+        printf '%s=%q\n' "${pair%%=*}" "${pair#*=}"
+    done
+}
+
+on() {
+    local node=$1
+    shift
+    { remote_prelude; remote_variables "$@"; cat; } | ssh_to "$node" 'bash -c "$(cat)"'
+}
+
+run_on() {
+    on "$1" <<<"$2"
+}
+
+require_reachable() {
+    local node
+    for node in "$@"; do
+        ssh_to "$node" true </dev/null 2>/dev/null || die "cannot reach $node ($SSH_USER@$(public_ip_of "$node")) over SSH"
+    done
+}
+
+preflight() {
+    require_local_tools
+    load_inventory "$1"
+    # shellcheck disable=SC2046
+    require_reachable $(node_names)
+}
+
+view_node() {
+    local node
+    for node in $(node_names); do
+        [ "$node" = "${1:-}" ] || { printf '%s' "$node"; return; }
+    done
+}
+
+cluster_view() {
+    on "$1" HOSTS="$(private_ips | paste -sd ' ' -)" <<<'read -r -a hosts <<<"$HOSTS"; in_mysql cluster-view "${hosts[@]}"'
+}
+
+agreed_primary_ip() {
+    local view seen
+    view=$(cluster_view "$(view_node "${1:-}")") || return 1
+    seen=$(awk '$2 != "-" { print $2 }' <<<"$view")
+    [ -n "$seen" ] && [ "$(wc -l <<<"$seen")" -ge "$(majority_of "$(node_count)")" ] || return 1
+    [ "$(sort -u <<<"$seen" | wc -l)" -eq 1 ] || return 1
+    head -n 1 <<<"$seen"
+}
+
+primary_node() {
+    local ip
+    ip=$(agreed_primary_ip "${1:-}") || die "online members do not agree on one primary, check 'mysqlctl status $CLUSTER'"
+    node_at "$ip" || die "primary $ip is not in the inventory"
+}
+
+primary_moved_from() {
+    local ip
+    ip=$(agreed_primary_ip "$1") || return 1
+    [ "$ip" != "$(private_ip_of "$1")" ]
+}
+
+primary_is() {
+    [ "$(agreed_primary_ip)" = "$(private_ip_of "$1")" ]
+}
+
+member_online() {
+    [ "$(run_on "$1" own_state 2>/dev/null)" = ONLINE ]
+}
+
+wait_for_member() {
+    wait_until "$1 to be an ONLINE member" "$JOIN_WAIT_SECONDS" member_online "$1"
+}
+
+online_members_seen_by() {
+    run_on "$1" "msql \"SELECT COUNT(*) FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE'\"" 2>/dev/null
+}
+
+whole_cluster_online() {
+    [ "$(online_members_seen_by "$1")" = "$(node_count)" ]
+}
+
+image_with_tag() {
+    [ -n "${1:-}" ] || { printf '%s' "$IMAGE"; return; }
+    local repository=${IMAGE%@*}
+    [[ ${repository##*/} == *:* ]] && repository=${repository%:*}
+    printf '%s:%s' "$repository" "$1"
+}
+
+running_from_checkout() {
+    [ "$REPO_DIR/ops/mysqlctl" -ef "$SCRIPT_PATH" ]
+}
+
+repo_file() {
+    running_from_checkout && { cat "$REPO_DIR/$1"; return; }
+    local cached="$SCRATCH/repo/$1"
+    if [ ! -s "$cached" ]; then
+        mkdir -p "$(dirname "$cached")"
+        curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/$MYSQLCTL_REF/$1" -o "$cached" \
+            || die "cannot download $1 from github.com/$GITHUB_REPO at $MYSQLCTL_REF"
+    fi
+    cat "$cached"
+}
+
+compose_for() {
+    local compose
+    compose=$(repo_file compose.yaml)
+    sed -E "s|^([[:space:]]+image:).*|\1 $1|" <<<"$compose"
+}
+
+inventory_variable_names() {
+    sed -n 's/^\([A-Z][A-Z0-9_]*\)=.*/\1/p' "$INVENTORY" | sort -u
+}
+
+passthrough_settings() {
+    local name
+    for name in $(inventory_variable_names | grep -E "$NODE_ENV_PASSTHROUGH" | grep -vx BACKUP_ENABLED); do
+        printf '%s=%s\n' "$name" "${!name}"
+    done
+}
+
+initial_env_for() {
+    local seed=false
+    [ "$1" = "$(first_node)" ] && seed=true
+    cat <<EOF
+MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+CLUSTER_ADMIN_PASSWORD=$CLUSTER_ADMIN_PASSWORD
+ROUTER_PASSWORD=$ROUTER_PASSWORD
+MYSQL_PRIVATE_IP=$(private_ip_of "$1")
+CLUSTER_HOSTS=$(cluster_hosts_csv)
+CLUSTER_SEED=$seed
+BACKUP_ENABLED=${BACKUP_ENABLED:-false}
+EOF
+    passthrough_settings
+}
+
+env_with() {
+    local content=$1 pair
+    shift
+    for pair in "$@"; do
+        content=$(awk -v key="${pair%%=*}" -v line="$pair" '
+            index($0, key "=") == 1 { print line; written = 1; next }
+            { print }
+            END { if (!written) print line }
+        ' <<<"$content")
+    done
+    printf '%s' "$content"
+}
+
+provision() {
+    local node=$1 env_content=$2
+    local setup compose
+    setup=$(repo_file host/setup)
+    compose=$(compose_for "$IMAGE")
+    log "$node: installing Docker, tuning the host, writing $REMOTE_DIR and pulling $IMAGE"
+    on "$node" SETUP="$setup" COMPOSE="$compose" ENV_CONTENT="$env_content" IMAGE="$IMAGE" <<'EOS'
+export DEBIAN_FRONTEND=noninteractive
+if ! docker compose version >/dev/null 2>&1; then
+    apt-get update -q </dev/null
+    apt-get install -yq docker.io docker-compose-v2 </dev/null
+fi
+printf '%s\n' "$SETUP" | sh -s
+install -d -m 755 "$MYSQL_DIR" "$TLS_DIR"
+rm -rf "$MYSQL_DIR/router"
+write_file "$MYSQL_DIR/compose.yaml" 644 "$COMPOSE"
+write_file "$MYSQL_DIR/.env" 600 "$ENV_CONTENT"
+docker pull -q "$IMAGE" </dev/null
+EOS
+}
+
+refuse_if_deployed() {
+    local node
+    for node in "$@"; do
+        run_on "$node" 'docker container inspect mysql-mysql-1 >/dev/null 2>&1 && exit 1 || exit 0' ||
+            die "$node already runs mysql-mysql-1; init is for new nodes only"
+    done
+}
+
+install_server_cert() {
+    on "$1" CA="$2" SERVER_CRT="$3" SERVER_KEY="$4" <<'EOS'
+install -d -m 755 "$TLS_DIR"
+write_file "$TLS_DIR/ca.crt" 644 "$CA"
+write_file "$TLS_DIR/server.crt" 644 "$SERVER_CRT"
+write_file "$TLS_DIR/server.key" 600 "$SERVER_KEY"
+chown "$MYSQL_UID" "$TLS_DIR/ca.crt" "$TLS_DIR/server.crt" "$TLS_DIR/server.key"
+EOS
+}
+
+fetch_remote_file() {
+    ssh_to "$1" cat "$2" </dev/null
+}
+
+certificate_names() {
+    printf '%s %s' "$TLS_NAMES" "$(private_ips | paste -sd ' ' -)"
+}
+
+generate_initial_certs() {
+    local node=$1 file
+    log "$node: generating the CA and the server certificate for: $(certificate_names)"
+    on "$node" IMAGE="$IMAGE" NAMES="$(certificate_names)" <<'EOS'
+install -d -m 755 "$TLS_DIR"
+read -r -a names <<<"$NAMES"
+docker run --rm -v "$TLS_DIR:/certs" --entrypoint generate-certs "$IMAGE" "${names[@]}" </dev/null
+EOS
+    mkdir -p "$TLS_LOCAL_DIR"
+    chmod 700 "$TLS_LOCAL_DIR"
+    for file in ca.crt ca.key; do
+        (umask 077 && fetch_remote_file "$node" "$REMOTE_DIR/tls/$file" > "$TLS_LOCAL_DIR/$file")
+    done
+    run_on "$node" 'rm -f "$TLS_DIR/ca.key" "$TLS_DIR/ca.srl"'
+    log "saved ca.crt and ca.key to $TLS_LOCAL_DIR (ca.key removed from $node)"
+}
+
+copy_server_cert() {
+    local from=$1 to=$2
+    install_server_cert "$to" "$(fetch_remote_file "$from" "$REMOTE_DIR/tls/ca.crt")" \
+        "$(fetch_remote_file "$from" "$REMOTE_DIR/tls/server.crt")" "$(fetch_remote_file "$from" "$REMOTE_DIR/tls/server.key")"
+}
+
+start_node() {
+    log "$1: docker compose up -d"
+    run_on "$1" 'compose up -d --quiet-pull'
+}
+
+new_password() {
+    openssl rand -hex 32
+}
+
+ensure_password() {
+    [ -n "${!1:-}" ] && return 0
+    set_inventory_var "$1" "$(new_password)"
+    log "generated $1 and stored it in $INVENTORY"
+}
+
+ensure_passwords() {
+    local name
+    for name in MYSQL_ROOT_PASSWORD CLUSTER_ADMIN_PASSWORD ROUTER_PASSWORD DB_PASSWORD; do
+        ensure_password "$name"
+    done
+}
+
+ask() {
+    local prompt=$1 default=${2:-}
+    read -r -p "$prompt${default:+ [$default]}: " ANSWER || die "no answer (input ended), nothing was changed"
+    ANSWER=${ANSWER:-$default}
+}
+
+ask_secret() {
+    read -r -s -p "$1: " ANSWER || die "no answer (input ended), nothing was changed"
+    printf '\n' >&2
+}
+
+ask_valid() {
+    local prompt=$1 default=$2 check=$3 problem=$4
+    while true; do
+        ask "$prompt" "$default"
+        "$check" "$ANSWER" && return 0
+        printf '  %s\n' "$problem" >&2
+    done
+}
+
+ask_yes() {
+    ask "$1 (y/n)" "$2"
+    [[ $ANSWER =~ ^[Yy] ]]
+}
+
+valid_mode() {
+    [[ $1 =~ ^(single|ha)$ ]]
+}
+
+valid_group_size() {
+    [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge "$FAILOVER_MINIMUM_NODES" ] && [ "$1" -le 9 ]
+}
+
+valid_tls_names() {
+    local name
+    for name in $1; do
+        [[ $name =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    done
+}
+
+valid_domain() {
+    [[ $1 =~ ^([a-z0-9-]+\.)+[a-z]{2,}$ ]]
+}
+
+valid_email() {
+    [[ $1 =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]
+}
+
+valid_https_url() {
+    [[ $1 =~ ^https://[^[:space:]]+$ ]]
+}
+
+valid_word() {
+    [[ $1 =~ ^[A-Za-z0-9._/+=-]+$ ]]
+}
+
+valid_identifier() {
+    [[ $1 =~ ^[a-z][a-z0-9_]{0,31}$ ]]
+}
+
+valid_interval() {
+    [[ $1 =~ ^[0-9]+$ ]] && [ "$1" -ge 60 ]
+}
+
+ask_node_count() {
+    [ "$1" = single ] && { ANSWER=1; return; }
+    ask_valid "How many servers (3 to 9, odd numbers survive more failures)" 3 valid_group_size "enter 3 to 9"
+}
+
+ask_node() {
+    local name public
+    printf '\nServer %s\n' "$1" >&2
+    ask_valid "  name" "$(printf 'mysql-%02d' "$1")" valid_node_name "lowercase letters, digits and -"
+    name=$ANSWER
+    ask_valid "  public IP (for SSH)" "" valid_ipv4 "enter an IPv4 address"
+    public=$ANSWER
+    ask_valid "  private VPC IP" "" valid_ipv4 "enter an IPv4 address"
+    ANSWER="$name=$public/$ANSWER"
+}
+
+public_ips_in() {
+    local entry address
+    for entry in $1; do
+        address=${entry#*=}
+        printf '%s\n' "${address%%/*}"
+    done | paste -sd ' ' -
+}
+
+inventory_line() {
+    local line
+    if [[ $2 =~ [\"\$\`\\] ]]; then
+        printf -v line '%s=%q' "$1" "$2"
+    else
+        printf -v line '%s="%s"' "$1" "$2"
+    fi
+    INVENTORY_TEXT+="$line"$'\n'
+}
+
+ask_backups() {
+    if ! ask_yes "Back up to S3-compatible storage" n; then
+        inventory_line BACKUP_ENABLED false
+        return 0
+    fi
+    inventory_line BACKUP_ENABLED true
+    ask_valid "  S3 endpoint" "https://sg-s3.storage.bunnycdn.com" valid_https_url "must start with https://"
+    inventory_line S3_ENDPOINT "$ANSWER"
+    ask_valid "  S3 region" "sg" valid_word "letters, digits and -"
+    inventory_line S3_REGION "$ANSWER"
+    ask_valid "  bucket (Bunny: storage zone name)" "" valid_word "letters, digits, . and -"
+    inventory_line S3_BUCKET "$ANSWER"
+    ask_valid "  access key (Bunny: storage zone name)" "" valid_word "letters, digits and ./+=-"
+    inventory_line S3_ACCESS_KEY_ID "$ANSWER"
+    ask_secret "  secret key (hidden)"
+    inventory_line S3_SECRET_ACCESS_KEY "$ANSWER"
+    ask_valid "  seconds between backups" 3600 valid_interval "60 or more"
+    inventory_line BACKUP_INTERVAL_SECONDS "$ANSWER"
+}
+
+ask_domain() {
+    ask_yes "Use your own domain with a free Let's Encrypt certificate (DNS on Cloudflare)" n || { ANSWER=''; return 0; }
+    ask_valid "  domain, e.g. mysql.example.com" "" valid_domain "a lowercase domain name like mysql.example.com"
+}
+
+ask_cloudflare_token() {
+    ask_secret "  Cloudflare API token with Zone > DNS > Edit for this domain (hidden)"
+    valid_word "$ANSWER" || die "that does not look like a Cloudflare API token"
+}
+
+ask_acme_settings() {
+    inventory_line ACME_DOMAIN "$1"
+    ask_valid "  email for Let's Encrypt notices" "" valid_email "an email address"
+    inventory_line ACME_EMAIL "$ANSWER"
+    ask_cloudflare_token
+    inventory_line CF_DNS_API_TOKEN "$ANSWER"
+}
+
+ask_database() {
+    ask_valid "Database for your application" laravel valid_identifier "lowercase letters, digits and _, starting with a letter"
+    inventory_line DB_DATABASE "$ANSWER"
+    ask_valid "Database user for your application" laravel valid_identifier "lowercase letters, digits and _, starting with a letter"
+    inventory_line DB_USERNAME "$ANSWER"
+}
+
+ask_inventory() {
+    local mode count index nodes='' domain
+    INVENTORY_TEXT=''
+    printf 'No inventory for cluster %s yet, answer a few questions (Enter keeps the [default]).\n\n' "$CLUSTER" >&2
+    ask_valid "Mode: single (1 server, no failover) or ha (3+ servers, automatic failover)" ha valid_mode "type single or ha"
+    mode=$ANSWER
+    ask_node_count "$mode"
+    count=$ANSWER
+    for index in $(seq 1 "$count"); do
+        ask_node "$index"
+        nodes="${nodes:+$nodes }$ANSWER"
+    done
+    printf '\n' >&2
+    inventory_line NODES "$nodes"
+    ask "SSH user" root
+    inventory_line SSH_USER "$ANSWER"
+    ask "Image" "$DEFAULT_IMAGE"
+    inventory_line IMAGE "$ANSWER"
+    ask_domain
+    domain=$ANSWER
+    ask_valid "Names clients use for TLS port $ROUTER_PORT: load balancer IP/hostname, space separated" "${domain:+$domain }$(public_ips_in "$nodes")" valid_tls_names "IPs or hostnames separated by spaces"
+    inventory_line TLS_NAMES "$ANSWER"
+    [ -z "$domain" ] || ask_acme_settings "$domain"
+    ask_database
+    ask_backups
+}
+
+create_inventory() {
+    local tmp
+    ask_inventory
+    printf '\n%s\n\n' "$(printf '%s' "$INVENTORY_TEXT" | grep -vE '^(S3_SECRET_ACCESS_KEY|CF_DNS_API_TOKEN)=')" >&2
+    ask_yes "Write this to $INVENTORY" y || die "aborted, nothing written"
+    mkdir -p "$CLUSTERS_DIR"
+    chmod 700 "$CLUSTERS_DIR"
+    tmp=$(mktemp "$INVENTORY.XXXXXX")
+    printf '%s' "$INVENTORY_TEXT" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$INVENTORY"
+    log "wrote $INVENTORY"
+}
+
+create_application_account() {
+    log "$1: creating database $DB_DATABASE and user $DB_USERNAME"
+    on "$1" DATABASE="$DB_DATABASE" USERNAME="$DB_USERNAME" PASSWORD="$DB_PASSWORD" <<'EOS'
+msql "CREATE DATABASE IF NOT EXISTS \`$DATABASE\`;
+CREATE USER IF NOT EXISTS '$USERNAME'@'%' IDENTIFIED BY '$PASSWORD';
+GRANT ALL PRIVILEGES ON \`$DATABASE\`.* TO '$USERNAME'@'%'"
+EOS
+}
+
+finish_seeding() {
+    run_on "$1" 'set_env_key CLUSTER_SEED false'
+}
+
+cmd_init() {
+    select_cluster "${1:-}"
+    [ -f "$INVENTORY" ] || create_inventory
+    preflight "${1:-}"
+    local first node
+    first=$(first_node)
+    # shellcheck disable=SC2046
+    refuse_if_deployed $(node_names)
+    [ -n "$TLS_NAMES" ] || log "warning: TLS_NAMES is empty, the certificate will only cover private IPs"
+    confirm "install docker.io docker-compose-v2 and run host/setup on: $(node_names | paste -sd ' ' -)" \
+        "write $REMOTE_DIR/compose.yaml and .env (mode 600), image $IMAGE" \
+        "generate certificates on $first for: $(certificate_names), download the CA to $TLS_LOCAL_DIR" \
+        "start every node: $first creates the InnoDB Cluster, the others join it by cloning $first" \
+        "create database $DB_DATABASE and user $DB_USERNAME on the primary"
+    lock_cluster
+    ensure_passwords
+    for node in $(node_names); do
+        provision "$node" "$(initial_env_for "$node")"
+    done
+    generate_initial_certs "$first"
+    for node in $(nodes_except "$first"); do
+        copy_server_cert "$first" "$node"
+    done
+    for node in $(node_names); do
+        start_node "$node"
+    done
+    wait_until "all $(node_count) members to be ONLINE" "$JOIN_WAIT_SECONDS" whole_cluster_online "$first"
+    finish_seeding "$first"
+    create_application_account "$(primary_node)"
+    show_status
+}
+
+collect_node_status() {
+    on "$1" <<'EOS'
+in_mysql node-status 2>/dev/null || echo "state=DOWN"
+echo "containers=$(docker ps -a --filter label=com.docker.compose.project=mysql --format '{{.Label "com.docker.compose.service"}}:{{.State}}' | sort | paste -sd ' ' -)"
+EOS
+}
+
+status_field() {
+    awk -v key="$2" 'index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }' "$1"
+}
+
+collect_cluster_status() {
+    local dir=$1 node
+    for node in $(node_names); do
+        { collect_node_status "$node" || echo "unreachable=1"; } > "$dir/$node" 2>/dev/null &
+    done
+    wait
+}
+
+megabytes() {
+    [[ ${1:-} =~ ^[0-9]+$ ]] || { printf -- '-'; return; }
+    printf '%sM' "$(($1 / 1048576))"
+}
+
+render_node_table() {
+    local dir=$1 node file
+    printf '%-12s %-15s %-15s %-10s %-9s %-5s %-7s %-7s %-15s %s\n' NODE PUBLIC PRIVATE STATE ROLE QUEUE BUFFER VERSION ROUTER CONTAINERS
+    for node in $(node_names); do
+        file="$dir/$node"
+        if [ -n "$(status_field "$file" unreachable)" ]; then
+            printf '%-12s %-15s %-15s %s\n' "$node" "$(public_ip_of "$node")" "$(private_ip_of "$node")" UNREACHABLE
+            continue
+        fi
+        printf '%-12s %-15s %-15s %-10s %-9s %-5s %-7s %-7s %-15s %s\n' "$node" "$(public_ip_of "$node")" "$(private_ip_of "$node")" \
+            "$(status_field "$file" state)" "$(status_field "$file" role)" "$(status_field "$file" queue)" \
+            "$(megabytes "$(status_field "$file" buffer_pool)")" "$(status_field "$file" version)" \
+            "$(status_field "$file" router | cut -c1-15)" "$(status_field "$file" containers)"
+    done
+}
+
+primary_ip_in() {
+    local dir=$1 node
+    for node in $(node_names); do
+        [ "$(status_field "$dir/$node" role)" = PRIMARY ] && [ "$(status_field "$dir/$node" state)" = ONLINE ] &&
+            { private_ip_of "$node"; return; }
+    done
+    return 0
+}
+
+node_problems() {
+    local file=$1 node=$2 primary=$3 container
+    [ -n "$(status_field "$file" unreachable)" ] && { echo "$node: unreachable over SSH"; return; }
+    [ "$(status_field "$file" state)" = ONLINE ] || echo "$node: member state is $(status_field "$file" state)"
+    for container in $(status_field "$file" containers); do
+        [ "${container#*:}" = running ] || echo "$node: container ${container%%:*} is ${container#*:}"
+    done
+    [ "$(status_field "$file" router)" = "$primary" ] || echo "$node: TLS connection through the router on :$ROUTER_PORT reached '$(status_field "$file" router)', expected the primary $primary"
+}
+
+cluster_problems() {
+    local dir=$1 node primaries primary
+    primaries=$(cat "$dir"/* | grep -cx 'role=PRIMARY' || true)
+    [ "$primaries" -eq 1 ] || echo "cluster: $primaries members report PRIMARY, expected 1"
+    primary=$(primary_ip_in "$dir")
+    for node in $(node_names); do
+        node_problems "$dir/$node" "$node" "$primary"
+    done
+}
+
+show_status() {
+    local dir problems
+    dir="$SCRATCH/status"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    collect_cluster_status "$dir"
+    render_node_table "$dir"
+    problems=$(cluster_problems "$dir")
+    if [ -z "$problems" ]; then
+        printf '\nhealthy\n'
+        return 0
+    fi
+    printf '\nproblems:\n' >&2
+    awk '{ print "  " $0 }' <<<"$problems" >&2
+    return 1
+}
+
+cmd_status() {
+    require_local_tools
+    load_inventory "${1:-}"
+    show_status
+}
+
+first_secondary_except() {
+    nodes_except "$1" | head -n 1
+}
+
+switch_primary_to() {
+    local target=$1 from=$2
+    log "setPrimaryInstance $(instance_of "$target") (primary is $from)"
+    on "$from" TARGET="$(instance_of "$target")" <<<'admin "dba.getCluster().setPrimaryInstance(\"$TARGET\")" >/dev/null'
+    wait_until "every member to agree that $target is the primary" 120 primary_is "$target"
+    log "primary is now $target"
+}
+
+fail_over_from() {
+    switch_primary_to "$(first_secondary_except "$1")" "$1"
+}
+
+cmd_failover() {
+    preflight "${1:-}"
+    local primary target=${2:-}
+    primary=$(primary_node)
+    [ "$(node_count)" -ge 2 ] || die "need at least one secondary to switch to"
+    [ -n "$target" ] || target=$(first_secondary_except "$primary")
+    has_node "$target" || die "unknown node $target"
+    [ "$target" != "$primary" ] || die "$target is already the primary"
+    confirm "setPrimaryInstance: move the primary role from $primary to $target (in-flight transactions finish first)" \
+        "wait until every online member agrees on $target"
+    lock_cluster
+    switch_primary_to "$target" "$primary"
+}
+
+pull_image_on() {
+    log "$1: pulling $2"
+    on "$1" IMAGE="$2" <<<'docker pull -q "$IMAGE" </dev/null >/dev/null'
+}
+
+upgrade_node() {
+    local node=$1 image=$2 compose
+    compose=$(compose_for "$image")
+    log "$node: writing compose.yaml for $image and recreating changed containers"
+    on "$node" COMPOSE="$compose" <<'EOS'
+write_file "$MYSQL_DIR/compose.yaml" 644 "$COMPOSE"
+compose up -d
+EOS
+}
+
+cmd_upgrade() {
+    preflight "${1:-}"
+    local image primary node
+    image=$(image_with_tag "${2:-}")
+    primary=$(primary_node)
+    confirm "pull $image on every node" \
+        "secondaries one at a time: write compose.yaml from this repo, docker compose up -d, wait until ONLINE ($(nodes_except "$primary" | paste -sd ' ' -))" \
+        "switch the primary away from $primary, then upgrade $primary the same way" \
+        "set IMAGE=$image in $INVENTORY"
+    lock_cluster
+    for node in $(node_names); do
+        pull_image_on "$node" "$image"
+    done
+    for node in $(nodes_except "$primary"); do
+        upgrade_node "$node" "$image"
+        wait_for_member "$node"
+    done
+    [ "$(node_count)" -lt 2 ] || fail_over_from "$primary"
+    upgrade_node "$primary" "$image"
+    wait_for_member "$primary"
+    set_inventory_var IMAGE "$image"
+    show_status
+}
+
+update_cluster_hosts() {
+    local skip=${1:-} hosts node
+    hosts=$(cluster_hosts_csv)
+    for node in $(node_names); do
+        [ "$node" = "$skip" ] && continue
+        log "$node: CLUSTER_HOSTS=$hosts in $REMOTE_DIR/.env (read on the next container start)"
+        on "$node" HOSTS="$hosts" <<<'set_env_key CLUSTER_HOSTS "$HOSTS"'
+    done
+}
+
+template_env_for() {
+    local private=$1 template
+    template=$(fetch_remote_file "$2" "$REMOTE_DIR/.env")
+    [ -n "$template" ] || die "could not read $REMOTE_DIR/.env on $2"
+    env_with "$template" "MYSQL_PRIVATE_IP=$private" "CLUSTER_SEED=false" "CLUSTER_HOSTS=$(cluster_hosts_csv)"
+}
+
+validate_new_node() {
+    local name=$1 address=$2
+    validate_node_name "$name"
+    validate_address "$address"
+    has_node "$name" && die "$name is already in the inventory"
+    private_ips | grep -qx "${address#*/}" && die "${address#*/} is already used by $(node_at "${address#*/}")"
+    return 0
+}
+
+plan_add_node() {
+    printf '%s\n' "install Docker and run host/setup on $1 (${2%%/*}), write $REMOTE_DIR from $3's .env with MYSQL_PRIVATE_IP=${2#*/}" \
+        "copy the server certificate from $3, start $1: it clones the primary and joins, wait until ONLINE" \
+        "add $1 to NODES and to CLUSTER_HOSTS on every other node (no restart)"
+}
+
+add_node() {
+    local name=$1 address=$2 template=$3 env_content
+    NODES="$NODES $name=$address"
+    env_content=$(template_env_for "${address#*/}" "$template")
+    provision "$name" "$env_content"
+    copy_server_cert "$template" "$name"
+    start_node "$name"
+    wait_for_member "$name"
+    set_inventory_var NODES "$NODES"
+    update_cluster_hosts "$name"
+    log "$name joined; add it to your load balancer and Cloud Firewall"
+    log "the server certificate does not list ${address#*/}; run rotate-certs if clients connect to it by private IP"
+}
+
+cmd_add_node() {
+    preflight "${1:-}"
+    local name=${2:-} address=${3:-} template
+    [ -n "$name" ] && [ -n "$address" ] || die "usage: mysqlctl add-node <cluster> <name> <public>/<private>"
+    validate_new_node "$name" "$address"
+    NODES="$NODES $name=$address"
+    require_reachable "$name"
+    NODES=$(nodes_without "$name")
+    template=$(primary_node)
+    local plan=() line
+    while IFS= read -r line; do plan+=("$line"); done < <(plan_add_node "$name" "$address" "$template")
+    confirm "${plan[@]}"
+    lock_cluster
+    add_node "$name" "$address" "$template"
+    show_status
+}
+
+stop_node() {
+    log "$1: docker compose down (the data directory is kept)"
+    run_on "$1" 'compose down' || log "warning: could not stop $1, continuing (it may already be gone)"
+}
+
+forget_member() {
+    local name=$1 primary=$2
+    log "$primary: removing $(instance_of "$name") and its router from the cluster metadata"
+    on "$primary" INSTANCE="$(instance_of "$name")" ROUTER="$(private_ip_of "$name")::$(private_ip_of "$name")" <<'EOS'
+listed() { [ "$(msql "SELECT COUNT(*) FROM mysql_innodb_cluster_metadata.instances WHERE address = '$INSTANCE'")" = 1 ]; }
+remove_listed_instance() {
+    listed || return 0
+    admin "dba.getCluster().removeInstance(\"$INSTANCE\", {force: true})" >/dev/null && return 0
+    ! listed
+}
+remove_listed_instance
+admin "var c = dba.getCluster(); if (\"$ROUTER\" in c.listRouters().routers) c.removeRouterMetadata(\"$ROUTER\")" >/dev/null
+EOS
+}
+
+refuse_unsafe_removal() {
+    local name=$1 primary=$2
+    has_node "$name" || die "$name is not in the inventory"
+    [ $(($(node_count) - 1)) -ge 3 ] || die "refusing: removing $name would leave fewer than 3 nodes"
+    [ "$name" != "$primary" ] || die "refusing: $name is the primary, run failover first (or use replace-node)"
+    return 0
+}
+
+plan_remove_node() {
+    printf '%s\n' "docker compose down on $1 (its data directory is kept)" \
+        "on the primary: removeInstance $(instance_of "$1") and remove its router from the metadata" \
+        "remove $1 from NODES and from CLUSTER_HOSTS on every remaining node"
+}
+
+remove_node() {
+    local name=$1 primary=$2
+    stop_node "$name"
+    forget_member "$name" "$primary"
+    NODES=$(nodes_without "$name")
+    set_inventory_var NODES "$NODES"
+    update_cluster_hosts
+    log "$name removed; take it out of your load balancer or destroy the droplet"
+}
+
+cmd_remove_node() {
+    require_local_tools
+    load_inventory "${1:-}"
+    local name=${2:-} primary
+    [ -n "$name" ] || die "usage: mysqlctl remove-node <cluster> <name>"
+    has_node "$name" || die "$name is not in the inventory"
+    # shellcheck disable=SC2046
+    require_reachable $(nodes_except "$name")
+    primary=$(primary_node "$name")
+    refuse_unsafe_removal "$name" "$primary"
+    local plan=() line
+    while IFS= read -r line; do plan+=("$line"); done < <(plan_remove_node "$name")
+    confirm "${plan[@]}"
+    lock_cluster
+    remove_node "$name" "$primary"
+    show_status
+}
+
+cmd_replace_node() {
+    require_local_tools
+    load_inventory "${1:-}"
+    local old=${2:-} name=${3:-} address=${4:-} primary
+    [ -n "$old" ] && [ -n "$name" ] && [ -n "$address" ] || die "usage: mysqlctl replace-node <cluster> <old> <new> <public>/<private>"
+    has_node "$old" || die "$old is not in the inventory"
+    validate_new_node "$name" "$address"
+    # shellcheck disable=SC2046
+    require_reachable $(nodes_except "$old")
+    primary=$(primary_node "$old")
+    NODES="$NODES $name=$address"
+    require_reachable "$name"
+    NODES=$(nodes_without "$name")
+    local template=$primary plan=() line
+    [ "$old" = "$primary" ] && template=$(first_secondary_except "$old") && plan+=("switch the primary away from $old to $template")
+    while IFS= read -r line; do plan+=("$line"); done < <(plan_add_node "$name" "$address" "$template")
+    while IFS= read -r line; do plan+=("$line"); done < <(plan_remove_node "$old")
+    confirm "${plan[@]}"
+    lock_cluster
+    [ "$old" != "$primary" ] || switch_primary_to "$template" "$old"
+    add_node "$name" "$address" "$template"
+    remove_node "$old" "$(primary_node "$old")"
+    show_status
+}
+
+issue_server_cert_on() {
+    on "$1" IMAGE="$(image_with_tag)" NAMES="$(certificate_names)" CA_CRT="$(cat "$TLS_LOCAL_DIR/ca.crt")" CA_KEY="$(cat "$TLS_LOCAL_DIR/ca.key")" <<'EOS'
+work=/root/mysqlctl-certs
+rm -rf "$work"
+install -d -m 700 "$work"
+write_file "$work/ca.crt" 644 "$CA_CRT"
+write_file "$work/ca.key" 600 "$CA_KEY"
+read -r -a names <<<"$NAMES"
+docker run --rm -v "$work:/certs" --entrypoint generate-certs "$IMAGE" "${names[@]}" </dev/null
+rm -f "$work/ca.key" "$work/ca.srl"
+EOS
+}
+
+router_reaches_primary_on() {
+    local reached
+    reached=$(run_on "$1" "in_mysql node-status | sed -n 's/^router=//p'" 2>/dev/null) || return 1
+    valid_ipv4 "$reached"
+}
+
+restart_router_on() {
+    log "$1: installing the new certificate and restarting the router"
+    install_server_cert "$1" "$(cat "$TLS_LOCAL_DIR/ca.crt")" "$2" "$3"
+    run_on "$1" 'compose restart router >/dev/null'
+}
+
+cmd_rotate_certs() {
+    preflight "${1:-}"
+    local issuer server_crt server_key node
+    [ -s "$TLS_LOCAL_DIR/ca.key" ] && [ -s "$TLS_LOCAL_DIR/ca.crt" ] || die "rotate-certs needs ca.crt and ca.key in $TLS_LOCAL_DIR"
+    issuer=$(first_node)
+    confirm "issue a new server certificate on $issuer from the local CA for: $(certificate_names)" \
+        "install it on every node and restart each router one at a time (connections through that node drop once)"
+    lock_cluster
+    issue_server_cert_on "$issuer"
+    server_crt=$(fetch_remote_file "$issuer" /root/mysqlctl-certs/server.crt)
+    server_key=$(fetch_remote_file "$issuer" /root/mysqlctl-certs/server.key)
+    run_on "$issuer" 'rm -rf /root/mysqlctl-certs'
+    for node in $(node_names); do
+        restart_router_on "$node" "$server_crt" "$server_key"
+        wait_until "$node's router to reach the primary over TLS" 60 router_reaches_primary_on "$node"
+    done
+    show_status
+}
+
+sql_on() {
+    on "$1" STATEMENT="$2" <<<'msql "$STATEMENT"'
+}
+
+start_writer() {
+    local writer=$1 table=$2
+    log "$writer: starting a writer (one INSERT per new TLS connection every 0.1 s through its router)"
+    on "$writer" TABLE="$table" PORT="$ROUTER_PORT" <<'EOS'
+dir=/root/mysqlctl-writer
+docker rm -f mysqlctl-writer >/dev/null 2>&1 || true
+rm -rf "$dir"
+install -d -m 700 "$dir"
+docker run -d --name mysqlctl-writer --network host --env-file "$MYSQL_DIR/.env" --entrypoint sleep "$(image_in_use)" infinity </dev/null >/dev/null
+cat > "$dir/loop" <<'LOOP'
+table=$1 port=$2 ip=$3 dir=$4 i=0
+while [ ! -e "$dir/stop" ]; do
+    i=$((i + 1))
+    if timeout 2 docker exec mysqlctl-writer sh -c 'MYSQL_PWD=$CLUSTER_ADMIN_PASSWORD exec mysql -u clusteradmin -h "$1" -P "$2" --ssl-mode=REQUIRED -e "INSERT INTO $3 VALUES ($4)"' sh "$ip" "$port" "$table" "$i" </dev/null >/dev/null 2>&1; then
+        result=OK
+    else
+        result=ERR
+    fi
+    printf '%s %s %s\n' "$(date +%s%3N)" "$i" "$result" >> "$dir/log"
+    sleep 0.1
+done
+touch "$dir/stopped"
+LOOP
+setsid nohup bash "$dir/loop" "$TABLE" "$PORT" "$(sed -n 's/^MYSQL_PRIVATE_IP=//p' "$MYSQL_DIR/.env")" "$dir" </dev/null >/dev/null 2>&1 &
+EOS
+}
+
+writer_has_acknowledged_writes() {
+    run_on "$1" 'grep -q " OK$" /root/mysqlctl-writer/log 2>/dev/null'
+}
+
+stop_writer() {
+    run_on "$1" 'dir=/root/mysqlctl-writer
+[ -d "$dir" ] || exit 0
+touch "$dir/stop"
+for _ in $(seq 50); do [ -e "$dir/stopped" ] && break; sleep 0.2; done
+docker rm -f mysqlctl-writer >/dev/null 2>&1 || true'
+}
+
+discard_writer() {
+    run_on "$1" 'touch /root/mysqlctl-writer/stop 2>/dev/null; docker rm -f mysqlctl-writer >/dev/null 2>&1; rm -rf /root/mysqlctl-writer' || true
+}
+
+kill_mysql_container() {
+    run_on "$1" 'date +%s%3N; docker kill mysql-mysql-1 >/dev/null'
+}
+
+start_mysql_container() {
+    run_on "$1" 'docker start mysql-mysql-1 >/dev/null' || true
+}
+
+failover_report() {
+    local log_file=$1 list_file=$2 stopped_at=$3 promoted_at=$4
+    awk -v stopped="$stopped_at" -v promoted="$promoted_at" -v list="$list_file" '
+        BEGIN { while ((getline value < list) > 0) stored[value] = 1 }
+        { attempts++ }
+        $3 == "OK" { acked++; if (!($2 in stored)) lost++; if ($1 > stopped && errors && !recovered) recovered = $1 }
+        $3 == "ERR" { errors++; if (!first_error) first_error = $1; last_error = $1 }
+        END {
+            printf "writes attempted:          %d\n", attempts
+            printf "acknowledged:              %d\n", acked
+            printf "failed:                    %d\n", errors
+            if (errors) printf "error window:              %.1f s (first error %.1f s after kill, last %.1f s after kill)\n", (last_error - first_error) / 1000, (first_error - stopped) / 1000, (last_error - stopped) / 1000
+            if (recovered) printf "writes recovered after:    %.1f s\n", (recovered - stopped) / 1000
+            printf "new primary agreed after:  %.1f s\n", (promoted - stopped) / 1000
+            printf "acknowledged writes lost:  %d\n", lost + 0
+        }
+    ' "$log_file"
+}
+
+cmd_test_failover() {
+    preflight "${1:-}"
+    [ "$(node_count)" -ge "$FAILOVER_MINIMUM_NODES" ] || die "test-failover needs at least $FAILOVER_MINIMUM_NODES nodes"
+    local primary writer table dir stopped_at promoted_at new_primary
+    primary=$(primary_node)
+    writer=$(first_secondary_except "$primary")
+    table="$FAILOVER_TEST_SCHEMA.writes"
+    confirm "create $table and start a writer on $writer: one INSERT every 0.1 s through $writer's router (:$ROUTER_PORT, TLS)" \
+        "docker kill mysql-mysql-1 on the primary $primary (real clients see errors for several seconds)" \
+        "wait for a new primary, keep writing ${FAILOVER_TEST_SETTLE_SECONDS}s, stop the writer" \
+        "docker start mysql-mysql-1 on $primary, wait until it rejoins, report, DROP DATABASE $FAILOVER_TEST_SCHEMA"
+    lock_cluster
+    on_exit "start_mysql_container '$primary'; discard_writer '$writer'"
+    dir="$SCRATCH/failover-test"
+    mkdir -p "$dir"
+    sql_on "$primary" "DROP DATABASE IF EXISTS $FAILOVER_TEST_SCHEMA; CREATE DATABASE $FAILOVER_TEST_SCHEMA; CREATE TABLE $table (id INT PRIMARY KEY)"
+    start_writer "$writer" "$table"
+    wait_until "the writer's first acknowledged write" 30 writer_has_acknowledged_writes "$writer"
+    sleep 2
+    log "$primary: docker kill mysql-mysql-1"
+    stopped_at=$(kill_mysql_container "$primary")
+    wait_until "a new primary" 120 primary_moved_from "$primary"
+    promoted_at=$(run_on "$writer" 'date +%s%3N')
+    sleep "$FAILOVER_TEST_SETTLE_SECONDS"
+    stop_writer "$writer"
+    fetch_remote_file "$writer" /root/mysqlctl-writer/log > "$dir/log"
+    new_primary=$(primary_node "$primary")
+    sql_on "$new_primary" "SELECT id FROM $table" > "$dir/list"
+    log "$primary: docker start mysql-mysql-1"
+    start_mysql_container "$primary"
+    wait_for_member "$primary"
+    sql_on "$new_primary" "DROP DATABASE $FAILOVER_TEST_SCHEMA"
+    discard_writer "$writer"
+    printf '\nfailover %s -> %s, %s rejoined\n' "$primary" "$new_primary" "$primary"
+    failover_report "$dir/log" "$dir/list" "$stopped_at" "$promoted_at"
+}
+
+backup_node() {
+    local ip
+    ip=$(sql_on "$(primary_node)" "SELECT MEMBER_HOST FROM performance_schema.replication_group_members WHERE MEMBER_STATE = 'ONLINE' ORDER BY MEMBER_ROLE = 'PRIMARY', MEMBER_HOST LIMIT 1")
+    node_at "$ip" || die "backup member $ip is not in the inventory"
+}
+
+cmd_backup_now() {
+    preflight "${1:-}"
+    [ "${BACKUP_ENABLED:-false}" = true ] || die "backups are not enabled for $CLUSTER"
+    local node
+    node=$(backup_node)
+    confirm "run backup (xtrabackup, zstd, upload to S3) on $node, the member that takes backups"
+    lock_cluster
+    log "$node: backup"
+    run_on "$node" 'in_mysql backup'
+}
+
+cmd_list() {
+    local file found=false
+    for file in "$CLUSTERS_DIR"/*.env; do
+        [ -e "$file" ] || continue
+        found=true
+        (
+            # shellcheck disable=SC1090
+            source "$file"
+            printf '%-16s %s node(s)  %s\n' "$(basename "$file" .env)" "$(wc -w <<<"${NODES:-}" | tr -d ' ')" "${TLS_NAMES:-}"
+        )
+    done
+    [ "$found" = true ] || log "no clusters in $CLUSTERS_DIR yet, create one with: mysqlctl init <name>"
+}
+
+connection_host() {
+    [ -n "${ACME_DOMAIN:-}" ] && { printf '%s' "$ACME_DOMAIN"; return; }
+    local names
+    read -r -a names <<<"$TLS_NAMES"
+    [ "${#names[@]}" -gt 0 ] && { printf '%s' "${names[0]}"; return; }
+    public_ip_of "$(first_node)"
+}
+
+cmd_env() {
+    load_inventory "${1:-}"
+    [ -n "${DB_PASSWORD:-}" ] || die "no database password yet, run: mysqlctl init $CLUSTER"
+    printf 'DB_CONNECTION=mysql\nDB_HOST=%s\nDB_PORT=%s\nDB_DATABASE=%s\nDB_USERNAME=%s\nDB_PASSWORD=%s\n' \
+        "$(connection_host)" "$ROUTER_PORT" "$DB_DATABASE" "$DB_USERNAME" "$DB_PASSWORD"
+    if [ -n "${ACME_DOMAIN:-}" ]; then
+        printf 'MYSQL_ATTR_SSL_CA=/etc/ssl/certs/ca-certificates.crt\n'
+        return
+    fi
+    [ -s "$TLS_LOCAL_DIR/ca.crt" ] || die "$TLS_LOCAL_DIR/ca.crt is missing, run: mysqlctl init $CLUSTER"
+    printf 'MYSQL_ATTR_SSL_CA=/tmp/mysql/ca.crt\nDB_SSL_CA_B64=%s\n' "$(base64 <"$TLS_LOCAL_DIR/ca.crt" | tr -d '\n')"
+}
+
+cmd_cli() {
+    preflight "${1:-}"
+    shift
+    local primary
+    primary=$(primary_node)
+    if [ "$#" -gt 0 ]; then
+        on "$primary" STATEMENT="$*" <<<'in_mysql sql -t -e "$STATEMENT"'
+        return
+    fi
+    if [ -t 0 ]; then
+        ssh -t -o StrictHostKeyChecking=accept-new "$SSH_USER@$(public_ip_of "$primary")" docker exec -it mysql-mysql-1 sql
+        return
+    fi
+    log "$primary: streaming standard input to mysql on the primary"
+    ssh_to "$primary" docker exec -i mysql-mysql-1 sql
+}
+
+cmd_ssh() {
+    load_inventory "${1:-}"
+    local node=${2:-$(first_node)}
+    has_node "$node" || die "unknown node $node, known: $(node_names | paste -sd ' ' -)"
+    ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$(public_ip_of "$node")"
+}
+
+cmd_version() {
+    printf 'mysqlctl %s (github.com/%s)\n' "$MYSQLCTL_REF" "$GITHUB_REPO"
+}
+
+cmd_self_update() {
+    curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/main/install.sh" \
+        | MYSQLCTL_INSTALL_DIR="$(dirname "$SCRIPT_PATH")" sh
+}
+
+remove_installed_command() {
+    if [ -w "$(dirname "$SCRIPT_PATH")" ]; then
+        rm -f "$SCRIPT_PATH"
+        return
+    fi
+    log "$(dirname "$SCRIPT_PATH") is not writable, using sudo"
+    sudo rm -f "$SCRIPT_PATH"
+}
+
+cmd_uninstall() {
+    running_from_checkout && die "this mysqlctl runs from a repository checkout, there is nothing to uninstall"
+    local purge=false
+    case "${1:-}" in
+        "") ;;
+        --purge) purge=true ;;
+        *) die "usage: mysqlctl uninstall [--purge]" ;;
+    esac
+    if [ "$purge" = true ]; then
+        confirm "remove $SCRIPT_PATH" "DELETE $STATE_DIR: every cluster's passwords and CA key (the servers keep running)"
+    else
+        confirm "remove $SCRIPT_PATH" "keep $STATE_DIR (cluster passwords and CA), delete it yourself or use --purge"
+    fi
+    remove_installed_command
+    log "removed $SCRIPT_PATH"
+    [ "$purge" = true ] || return 0
+    rm -rf "$STATE_DIR"
+    log "deleted $STATE_DIR"
+}
+
+certificate_issued_on() {
+    run_on "$1" 'docker exec mysql-router-1 sh -c "ls /acme/lego/certificates/*.crt" >/dev/null 2>&1'
+}
+
+lego_log_on() {
+    run_on "$1" 'docker exec mysql-router-1 tail -n 3 /acme/lego.log 2>/dev/null' | tr '\n' ' '
+}
+
+wait_for_certificate_on() {
+    local deadline=$((SECONDS + ACME_WAIT_SECONDS))
+    log "$1: waiting for Let's Encrypt to issue the certificate"
+    until certificate_issued_on "$1"; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            log "$1: $(lego_log_on "$1")"
+            die "no certificate on $1 after ${ACME_WAIT_SECONDS}s; check the token and that $ACME_DOMAIN exists in Cloudflare. The router keeps serving the old certificate and retries every 5 minutes"
+        fi
+        sleep 5
+    done
+    log "$1: certificate issued"
+}
+
+enable_domain_on() {
+    log "$1: switching the router to the Let's Encrypt certificate for $ACME_DOMAIN"
+    on "$1" DOMAIN="$ACME_DOMAIN" EMAIL="$ACME_EMAIL" TOKEN="$CF_DNS_API_TOKEN" COMPOSE="$2" IMAGE="$IMAGE" <<'EOS'
+docker pull -q "$IMAGE" </dev/null >/dev/null
+write_file "$MYSQL_DIR/compose.yaml" 644 "$COMPOSE"
+set_env_key ACME_DOMAIN "$DOMAIN"
+set_env_key ACME_EMAIL "$EMAIL"
+set_env_key CF_DNS_API_TOKEN "$TOKEN"
+compose up -d --no-deps --force-recreate router >/dev/null 2>&1
+EOS
+}
+
+cmd_domain() {
+    preflight "${1:-}"
+    local domain email token compose node
+    ask_valid "Domain, e.g. mysql.example.com" "${ACME_DOMAIN:-}" valid_domain "a lowercase domain name like mysql.example.com"
+    domain=$ANSWER
+    ask_valid "Email for Let's Encrypt notices" "${ACME_EMAIL:-}" valid_email "an email address"
+    email=$ANSWER
+    ask_cloudflare_token
+    token=$ANSWER
+    confirm "save ACME_DOMAIN=$domain, ACME_EMAIL and CF_DNS_API_TOKEN in $INVENTORY" \
+        "on each node, one at a time: pull $IMAGE, write compose.yaml, recreate the router and wait for the certificate" \
+        "connections through a node's router drop once while it restarts; clients reconnect"
+    lock_cluster
+    set_inventory_var ACME_DOMAIN "$domain"
+    set_inventory_var ACME_EMAIL "$email"
+    set_inventory_var CF_DNS_API_TOKEN "$token"
+    compose=$(compose_for "$IMAGE")
+    for node in $(node_names); do
+        enable_domain_on "$node" "$compose"
+        wait_for_certificate_on "$node"
+    done
+    log "done: point $domain (DNS only, grey cloud) at your load balancer or the servers' public IPs, then run: mysqlctl env $CLUSTER"
+}
+
+main() {
+    local arguments=() argument
+    for argument in "$@"; do
+        case "$argument" in
+            -y | --yes) YES=true ;;
+            *) arguments+=("$argument") ;;
+        esac
+    done
+    set -- ${arguments[@]+"${arguments[@]}"}
+    trap run_exit_hooks EXIT
+    create_scratch_dir
+    local command=${1:-help}
+    shift || true
+    case "$command" in
+        init | status | add-node | remove-node | replace-node | failover | upgrade | rotate-certs | test-failover | backup-now | domain | list | env | cli | ssh | version | self-update | uninstall)
+            "cmd_${command//-/_}" "$@"
+            ;;
+        help | -h | --help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

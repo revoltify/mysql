@@ -1,0 +1,7 @@
+.env*
+!.env.example
+/data/
+/router/
+/tls/
+/acme/
+/backup/

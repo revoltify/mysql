@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LAB_DIR="$(cd "$(dirname "$0")" && pwd)"
+export LAB_DIR
+export MYSQLCTL_HOME="$LAB_DIR/state"
+export PATH="$LAB_DIR/bin:$PATH"
+
+write_ssh_config() {
+    local index
+    for index in 1 2 3 4; do
+        printf 'Host 10.88.0.2%s\n  HostName 127.0.0.1\n  Port 222%s\n  User root\n  IdentityFile %s/key/id_ed25519\n  UserKnownHostsFile /dev/null\n  StrictHostKeyChecking no\n  LogLevel ERROR\n\n' \
+            "$index" "$index" "$LAB_DIR"
+    done > "$LAB_DIR/ssh_config"
+}
+
+write_inventory() {
+    [ -f "$MYSQLCTL_HOME/clusters/lab.env" ] && return 0
+    install -d -m 700 "$MYSQLCTL_HOME" "$MYSQLCTL_HOME/clusters"
+    cat > "$MYSQLCTL_HOME/clusters/lab.env" <<'INVENTORY'
+NODES="mysql-01=10.88.0.21/10.88.0.21 mysql-02=10.88.0.22/10.88.0.22 mysql-03=10.88.0.23/10.88.0.23"
+SSH_USER="root"
+IMAGE="10.88.0.5:5000/mysql:dev"
+TLS_NAMES="mysql.lab.test"
+DB_DATABASE="laravel"
+DB_USERNAME="laravel"
+MYSQL_BUFFER_POOL_SIZE="268435456"
+BACKUP_ENABLED="true"
+S3_ENDPOINT="http://10.88.0.6:9000"
+S3_ALLOW_HTTP="true"
+S3_REGION="us-east-1"
+S3_BUCKET="backups"
+S3_ACCESS_KEY_ID="labaccess"
+S3_SECRET_ACCESS_KEY="labsecretlabsecret"
+BACKUP_INTERVAL_SECONDS="3600"
+INVENTORY
+    chmod 600 "$MYSQLCTL_HOME/clusters/lab.env"
+}
+
+up() {
+    install -d -m 700 "$LAB_DIR/key"
+    [ -s "$LAB_DIR/key/id_ed25519" ] || ssh-keygen -q -t ed25519 -N '' -f "$LAB_DIR/key/id_ed25519"
+    (cd "$LAB_DIR" && docker compose up -d --build)
+    docker tag "${LAB_IMAGE:-mysql-cluster:dev}" localhost:5005/mysql:dev
+    docker push -q localhost:5005/mysql:dev
+    write_ssh_config
+    write_inventory
+}
+
+case "${1:-}" in
+    up) up ;;
+    down) (cd "$LAB_DIR" && docker compose down -v -t 5) && rm -rf "$LAB_DIR/state" ;;
+    *) exec "$LAB_DIR/../../ops/mysqlctl" "$@" ;;
+esac

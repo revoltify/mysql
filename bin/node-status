@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+. /usr/local/lib/mysql-cluster/topology.sh
+
+: "${ROUTER_PORT:=6446}"
+
+drop_privileges "$0" "$@"
+
+own_member_field() {
+    sql -e "SELECT $1 FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid" 2>/dev/null
+}
+
+applier_queue() {
+    sql -e "SELECT COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE FROM performance_schema.replication_group_member_stats WHERE MEMBER_ID = @@server_uuid" 2>/dev/null
+}
+
+primary_through_router() {
+    write_admin_client_config
+    mysql --defaults-extra-file="$ADMIN_CLIENT_CONFIG" -h "$MYSQL_PRIVATE_IP" -P "$ROUTER_PORT" --ssl-mode=REQUIRED \
+        --connect-timeout="$PEER_TIMEOUT_SECONDS" -NB -e 'SELECT @@report_host' </dev/null 2>&1 | tail -n 1
+}
+
+printf 'state=%s\n' "$(own_member_field MEMBER_STATE)"
+printf 'role=%s\n' "$(own_member_field MEMBER_ROLE)"
+printf 'queue=%s\n' "$(applier_queue)"
+printf 'version=%s\n' "$(sql -e 'SELECT @@version' 2>/dev/null)"
+printf 'buffer_pool=%s\n' "$(sql -e 'SELECT @@innodb_buffer_pool_size' 2>/dev/null)"
+printf 'router=%s\n' "$(primary_through_router)"

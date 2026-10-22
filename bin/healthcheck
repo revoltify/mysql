@@ -1,0 +1,5 @@
+#!/bin/sh
+
+[ -e /tmp/mysql-starting ] && exit 0
+
+mysqladmin --socket=/var/run/mysqld/mysqld.sock --connect-timeout=3 ping > /dev/null 2>&1

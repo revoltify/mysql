@@ -1,0 +1,158 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+. /usr/local/lib/mysql-cluster/tuning.sh
+. /usr/local/lib/mysql-cluster/topology.sh
+
+RUNTIME_CONF=/etc/mysql/conf.d/runtime.cnf
+INIT_SQL=/tmp/mysql-init.sql
+STARTING_MARKER=/tmp/mysql-starting
+RESTART_EXIT_CODE=16
+
+[ "$(id -u)" = "0" ] && own_directories "$DATA_DIR" "$BACKUP_TMP_DIR"
+drop_privileges "$0" "$@"
+
+validate_env() {
+    validate_passwords
+    validate_topology_env
+    require_boolean BACKUP_ENABLED
+    require_boolean RESTORE_ON_EMPTY
+    require_integer_at_least MYSQL_BUFFER_POOL_PERCENT 10
+    [ "$MYSQL_BUFFER_POOL_PERCENT" -le 90 ] || fail "MYSQL_BUFFER_POOL_PERCENT must be at most 90"
+    reserved=$(reserved_env_directives | tr '\n' ' ')
+    [ -z "$reserved" ] || fail "managed by the image, cannot be overridden: $reserved"
+    [ "$BACKUP_ENABLED" = "false" ] || validate_backup_env
+}
+
+write_runtime_conf() {
+    tuned=$(tuned_directives)
+    {
+        printf '[mysqld]\n'
+        printf 'bind_address=%s,127.0.0.1\n' "$MYSQL_PRIVATE_IP"
+        printf 'report_host=%s\n' "$MYSQL_PRIVATE_IP"
+        printf 'server_id=%s\n' "$(server_id_for "$MYSQL_PRIVATE_IP")"
+        printf '%s\n' "$tuned"
+        env_directives
+    } > "$RUNTIME_CONF"
+    log "tuned: $(printf '%s' "$tuned" | tr '\n' ' ') overrides: $(env_directives | cut -d = -f 1 | tr '\n' ' ')"
+}
+
+data_initialized() {
+    [ -d "$DATA_DIR/mysql" ]
+}
+
+write_init_sql() {
+    umask 077
+    cat > "$INIT_SQL" <<EOF
+SET sql_log_bin = 0;
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';
+CREATE USER '$CLUSTER_ADMIN_USER'@'%' IDENTIFIED BY '$CLUSTER_ADMIN_PASSWORD';
+GRANT ALL PRIVILEGES ON *.* TO '$CLUSTER_ADMIN_USER'@'%' WITH GRANT OPTION;
+EOF
+}
+
+initialize_data_dir() {
+    log "initializing an empty data directory"
+    write_init_sql
+    mysqld --initialize-insecure --init-file="$INIT_SQL" || fail "mysqld --initialize failed"
+    rm -f "$INIT_SQL"
+}
+
+restore_wanted() {
+    [ "$BACKUP_ENABLED" = "true" ] && [ "$RESTORE_ON_EMPTY" = "true" ] && [ "$CLUSTER_SEED" = "true" ] && no_reachable_peer_has_metadata
+}
+
+restore_from_backup() {
+    restore_wanted || return 1
+    status=0
+    restore-latest || status=$?
+    [ "$status" -eq 0 ] && return 0
+    [ "$status" -eq 2 ] && return 1
+    fail "restore failed, refusing to start with empty data"
+}
+
+prepare_data_dir() {
+    data_initialized && return 0
+    data_dir_empty || fail "$DATA_DIR has files but no MySQL data, empty it or restore it by hand"
+    restore_from_backup && return 0
+    initialize_data_dir
+}
+
+wait_for_mysql() {
+    until mysql_alive; do
+        sleep 1
+    done
+}
+
+seconds_since_latest_backup() {
+    latest=$(backup_names | tail -n 1)
+    [ -n "$latest" ] || return 1
+    printf '%s' "$(($(date -u +%s) - $(backup_epoch "$latest")))"
+}
+
+next_backup_delay() {
+    age=$(seconds_since_latest_backup) || { printf '0'; return; }
+    delay=$((BACKUP_INTERVAL_SECONDS - age))
+    [ "$delay" -gt 0 ] && printf '%s' "$delay" || printf '0'
+}
+
+backup_loop() {
+    floor=$BACKUP_RETRY_SECONDS
+    [ "$floor" -gt "$BACKUP_INTERVAL_SECONDS" ] && floor=$BACKUP_INTERVAL_SECONDS
+    delay=$(next_backup_delay)
+    while true; do
+        log "next backup in ${delay}s"
+        sleep "$delay"
+        backup || log "ERROR: backup failed"
+        delay=$(next_backup_delay)
+        [ "$delay" -lt "$floor" ] && delay=$floor
+    done
+}
+
+after_start() {
+    wait_for_mysql
+    rm -f "$STARTING_MARKER"
+    cluster-agent &
+    [ "$BACKUP_ENABLED" = "true" ] && backup_loop
+    wait
+}
+
+stop_mysqld() {
+    stopping=true
+    kill -TERM "$mysqld_pid" 2>/dev/null || true
+}
+
+wait_for_mysqld_exit() {
+    status=0
+    while kill -0 "$mysqld_pid" 2>/dev/null; do
+        status=0
+        wait "$mysqld_pid" || status=$?
+    done
+}
+
+supervise_mysqld() {
+    stopping=false
+    trap stop_mysqld TERM INT
+    export MYSQLD_PARENT_PID=$$
+    while true; do
+        mysqld &
+        mysqld_pid=$!
+        wait_for_mysqld_exit
+        [ "$status" -eq "$RESTART_EXIT_CODE" ] && [ "$stopping" = "false" ] || exit "$status"
+        log "mysqld asked to be restarted (after a clone), starting it again"
+    done
+}
+
+main() {
+    touch "$STARTING_MARKER"
+    validate_env
+    write_root_client_config
+    write_runtime_conf
+    rm -rf "$BACKUP_TMP_DIR"/backup.* "$BACKUP_TMP_DIR"/restore.*
+    prepare_data_dir
+    (set +e; after_start &)
+    supervise_mysqld
+}
+
+main

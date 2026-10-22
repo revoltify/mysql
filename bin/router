@@ -1,0 +1,123 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+. /usr/local/lib/mysql-cluster/topology.sh
+. /usr/local/lib/mysql-cluster/acme.sh
+
+ROUTER_DIR=/router
+ROUTER_CONF=$ROUTER_DIR/mysqlrouter.conf
+ROUTER_ACCOUNT=router
+TLS_DIR=/tls
+RENEW_CHECK_SECONDS=43200
+RENEW_RETRY_SECONDS=300
+
+: "${ROUTER_PORT:=6446}"
+
+if [ "$(id -u)" = "0" ]; then
+    own_directories "$ROUTER_DIR"
+    acme_enabled && own_directories "$ACME_DIR"
+fi
+drop_privileges "$0" "$@"
+
+validate_env() {
+    validate_passwords ROUTER_PASSWORD
+    validate_topology_env
+    validate_acme_env
+    require_integer_at_least ROUTER_PORT 1
+    for file in server.crt server.key; do
+        [ -r "$TLS_DIR/$file" ] || fail "$TLS_DIR/$file is missing or unreadable, create it with generate-certs"
+    done
+}
+
+served_certificate() {
+    acme_enabled && { printf '%s' "$SERVING_CERTIFICATE"; return; }
+    printf '%s/server.crt' "$TLS_DIR"
+}
+
+served_key() {
+    acme_enabled && { printf '%s' "$SERVING_KEY"; return; }
+    printf '%s/server.key' "$TLS_DIR"
+}
+
+wait_for_primary() {
+    until online_primary; do
+        log "no primary online yet, retrying in 5s"
+        sleep 5
+    done
+}
+
+without_x_protocol_routes() {
+    awk '/^\[/ { skip = ($0 ~ /^\[routing:bootstrap_x_/) } !skip' "$ROUTER_CONF" > "$ROUTER_CONF.new"
+    mv "$ROUTER_CONF.new" "$ROUTER_CONF"
+}
+
+bootstrap() {
+    primary=$(wait_for_primary)
+    log "registering this router with the cluster through primary $primary"
+    printf '%s\n%s\n' "$CLUSTER_ADMIN_PASSWORD" "$ROUTER_PASSWORD" | mysqlrouter --bootstrap "$CLUSTER_ADMIN_USER@$(instance_address "$primary")" \
+        --directory "$ROUTER_DIR" --force --name "$MYSQL_PRIVATE_IP" --report-host "$MYSQL_PRIVATE_IP" \
+        --account "$ROUTER_ACCOUNT" --account-host '%' --account-create if-not-exists \
+        --disable-rest --disable-rw-split \
+        --client-ssl-mode REQUIRED --client-ssl-cert "$(served_certificate)" --client-ssl-key "$(served_key)" \
+        --server-ssl-mode PREFERRED --server-ssl-verify DISABLED \
+        --conf-set-option="routing:bootstrap_rw.bind_port=$ROUTER_PORT" \
+        --conf-set-option="routing:bootstrap_ro.bind_port=$((ROUTER_PORT + 1))" \
+        --conf-set-option="DEFAULT.logging_folder=" > /dev/null
+    without_x_protocol_routes
+}
+
+use_served_certificate() {
+    sed -i -e "s|^client_ssl_cert=.*|client_ssl_cert=$(served_certificate)|" -e "s|^client_ssl_key=.*|client_ssl_key=$(served_key)|" "$ROUTER_CONF"
+}
+
+refresh_certificate() {
+    renew_acme_certificate || true
+    write_serving_certificate "$TLS_DIR/server.crt" "$TLS_DIR/server.key"
+}
+
+seconds_until_next_renewal() {
+    acme_certificate_ready && { printf '%s' "$RENEW_CHECK_SECONDS"; return; }
+    printf '%s' "$RENEW_RETRY_SECONDS"
+}
+
+start_router() {
+    mysqlrouter -c "$ROUTER_CONF" &
+    router_pid=$!
+}
+
+stop_router() {
+    kill -TERM "$router_pid" 2>/dev/null || true
+    wait "$router_pid" || true
+}
+
+shut_down() {
+    stop_router
+    exit 0
+}
+
+keep_certificate_fresh() {
+    trap shut_down TERM INT
+    while kill -0 "$router_pid" 2>/dev/null; do
+        sleep "$(seconds_until_next_renewal)" &
+        wait $! || true
+        refresh_certificate || continue
+        log "certificate for $ACME_DOMAIN updated, restarting the router"
+        stop_router
+        start_router
+    done
+}
+
+main() {
+    validate_env
+    acme_enabled && { refresh_certificate || true; }
+    [ -s "$ROUTER_CONF" ] || bootstrap
+    use_served_certificate
+    log "TLS required on :$ROUTER_PORT (read-write) and :$((ROUTER_PORT + 1)) (read-only), routing to cluster $CLUSTER_NAME"
+    acme_enabled || exec mysqlrouter -c "$ROUTER_CONF"
+    acme_certificate_ready || log "WARNING: serving the private certificate until Let's Encrypt succeeds for $ACME_DOMAIN"
+    start_router
+    keep_certificate_fresh
+}
+
+main

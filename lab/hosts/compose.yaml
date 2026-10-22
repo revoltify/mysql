@@ -1,0 +1,45 @@
+name: mysqlctl-lab
+
+x-host: &host
+  build: .
+  privileged: true
+  mem_limit: 1200m
+  volumes:
+    - ./key:/lab:ro
+
+services:
+  registry:
+    image: registry:2
+    ports: ["127.0.0.1:5005:5000"]
+    networks: { lab: { ipv4_address: 10.88.0.5 } }
+
+  s3:
+    image: versity/versitygw:v1.9.0@sha256:eb7f786fcd91e72194e48fcf1ac16302d686bf8e3a71434bdbc067a6efd3fdc7
+    entrypoint: [sh, -c, "mkdir -p /data/backups && exec versitygw --access labaccess --secret labsecretlabsecret --port :9000 posix /data"]
+    networks: { lab: { ipv4_address: 10.88.0.6 } }
+
+  host-1:
+    <<: *host
+    ports: ["127.0.0.1:2221:22"]
+    networks: { lab: { ipv4_address: 10.88.0.21 } }
+
+  host-2:
+    <<: *host
+    ports: ["127.0.0.1:2222:22"]
+    networks: { lab: { ipv4_address: 10.88.0.22 } }
+
+  host-3:
+    <<: *host
+    ports: ["127.0.0.1:2223:22"]
+    networks: { lab: { ipv4_address: 10.88.0.23 } }
+
+  host-4:
+    <<: *host
+    ports: ["127.0.0.1:2224:22"]
+    networks: { lab: { ipv4_address: 10.88.0.24 } }
+
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 10.88.0.0/24

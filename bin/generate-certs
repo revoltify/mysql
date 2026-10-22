@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+
+CERT_DIR=/certs
+CA_DAYS=3650
+LEAF_DAYS=825
+MYSQL_UID=999
+
+[ "$#" -ge 1 ] || fail "usage: generate-certs <hostname-or-ip>... (every name clients use to reach the router port)"
+
+subject_alt_names() {
+    for name in "$@"; do
+        case "$name" in
+            *[!0-9.]*) printf 'DNS:%s\n' "$name" ;;
+            *) printf 'IP:%s\n' "$name" ;;
+        esac
+    done | paste -sd ',' -
+}
+
+new_key() {
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1" 2>/dev/null
+    chmod 600 "$1"
+}
+
+create_ca() {
+    [ -s ca.key ] && return 0
+    new_key ca.key
+    openssl req -x509 -new -key ca.key -sha256 -days "$CA_DAYS" -subj "/CN=MySQL Cluster CA" -out ca.crt
+    log "created ca.crt"
+}
+
+issue_server_certificate() {
+    new_key server.key
+    printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\nkeyUsage=digitalSignature\n' "$(subject_alt_names "$@")" > server.ext
+    openssl req -new -key server.key -subj "/CN=mysql-router" \
+        | openssl x509 -req -CA ca.crt -CAkey ca.key -CAcreateserial -days "$LEAF_DAYS" -sha256 -extfile server.ext -out server.crt 2>/dev/null
+    rm -f server.ext
+    log "issued server.crt for: $*"
+}
+
+main() {
+    cd "$CERT_DIR"
+    create_ca
+    issue_server_certificate "$@"
+    chown "$MYSQL_UID" server.key server.crt ca.crt
+    log "done: give ca.crt to the app; keep ca.key offline"
+}
+
+main "$@"

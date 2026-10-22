@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+. /usr/local/lib/mysql-cluster/common.sh
+. /usr/local/lib/mysql-cluster/topology.sh
+
+drop_privileges "$0" "$@"
+
+[ "$#" -ge 1 ] || fail "usage: cluster-view <private-ip>..."
+
+for host in "$@"; do
+    printf '%s %s\n' "$host" "$(primary_seen_by "$host" || printf -- '-')"
+done
