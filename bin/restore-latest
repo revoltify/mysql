@@ -47,16 +47,20 @@ restore() {
     log "restored $1"
 }
 
+nothing_to_restore() {
+    [ -z "${RESTORE_PATH:-}" ] || fail "RESTORE_PATH has no backups under s3://$S3_BUCKET/$BACKUP_PATH/"
+    log "WARNING: no backups under s3://$S3_BUCKET/$BACKUP_PATH/, starting empty"
+    exit 2
+}
+
 main() {
     validate_backup_env
     mysql_alive && fail "mysqld is running, stop it before restoring"
     data_dir_empty || fail "$DATA_DIR is not empty"
 
-    backups=$(backup_names) || fail "cannot list backups in s3"
-    if [ -z "$backups" ]; then
-        log "WARNING: no backups under s3://$S3_BUCKET/$BACKUP_PATH/, starting empty"
-        exit 2
-    fi
+    restore_source
+    backups=$(restore_candidates) || fail "cannot list backups in s3"
+    [ -n "$backups" ] || nothing_to_restore
 
     workdir=$(mktemp -d "$BACKUP_TMP_DIR/restore.XXXXXX")
     trap 'rm -rf "$workdir"' EXIT

@@ -6,6 +6,7 @@ RUN_USER=mysql
 ROOT_CLIENT_CONFIG=/tmp/mysql-root.cnf
 MYSQL_SOCKET=/var/run/mysqld/mysqld.sock
 BACKUP_PATH="${BACKUP_PATH:-mysql}"
+BACKUP_PATH_PATTERN='[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*'
 BACKUP_NAME_PATTERN='^backup-[0-9]{8}T[0-9]{6}Z\.xbstream\.zst$'
 BACKUP_TMP_DIR="${BACKUP_TMP_DIR:-/var/lib/mysql-backup}"
 PASSWORD_PATTERN='[A-Za-z0-9_-]{32,}'
@@ -118,6 +119,22 @@ size_of() {
 backup_names() {
     objects=$(s3_list) || return 1
     printf '%s\n' "$objects" | grep -E "$BACKUP_NAME_PATTERN" | sort
+}
+
+use_restore_path() {
+    require_matching RESTORE_PATH "$BACKUP_PATH_PATTERN" 'RESTORE_PATH must be an S3 path such as mysql/old, without . or .. segments'
+    BACKUP_PATH=$RESTORE_PATH
+}
+
+restore_source() {
+    [ -z "${RESTORE_PATH:-}" ] || use_restore_path
+    [ -z "${RESTORE_BACKUP:-}" ] || printf '%s' "$RESTORE_BACKUP" | grep -Eq "$BACKUP_NAME_PATTERN" \
+        || fail "RESTORE_BACKUP must be a backup name as printed by list-backups"
+}
+
+restore_candidates() {
+    [ -n "${RESTORE_BACKUP:-}" ] || { backup_names; return; }
+    printf '%s\n' "$RESTORE_BACKUP"
 }
 
 backup_epoch() {

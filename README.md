@@ -320,6 +320,22 @@ mysqlctl backup-now main
 
 If the cluster is created again on empty servers, the first server restores the newest valid backup before the others join.
 
+To see which backups exist, run `list-backups` on any server. It reads `BACKUP_PATH` by default, or the path you give it:
+
+```bash
+docker exec mysql-mysql-1 list-backups
+docker exec mysql-mysql-1 list-backups mysql/old-cluster
+```
+
+To start a new cluster from another cluster's backups, or from an older backup, add these lines to the first server's `.env` before its first start:
+
+```ini
+RESTORE_PATH=mysql/old-cluster
+RESTORE_BACKUP=backup-20260101T030000Z.xbstream.zst
+```
+
+`RESTORE_PATH` is only read for the restore. New backups still go to `BACKUP_PATH`, so give the new cluster its own path. `RESTORE_BACKUP` picks one backup by its `list-backups` name instead of the newest. Both apply only on the first server (`CLUSTER_SEED=true`) when it starts with an empty data directory. If the path has no backups or the named backup cannot be restored, the server refuses to start instead of starting empty.
+
 <a name="running-sql"></a>
 ### Running SQL
 
