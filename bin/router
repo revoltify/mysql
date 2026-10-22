@@ -67,6 +67,12 @@ bootstrap() {
     without_x_protocol_routes
 }
 
+route_reads_to_secondaries_and_replicas() {
+    primary=$(online_primary) || { log "WARNING: no primary online, read_only_targets left unchanged"; return 0; }
+    cluster_shell "$primary" "dba.getCluster().setRoutingOption('read_only_targets', 'all')" > /dev/null \
+        || log "WARNING: could not set read_only_targets=all through primary $primary"
+}
+
 use_served_certificate() {
     sed -i -e "s|^client_ssl_cert=.*|client_ssl_cert=$(served_certificate)|" -e "s|^client_ssl_key=.*|client_ssl_key=$(served_key)|" "$ROUTER_CONF"
 }
@@ -112,6 +118,7 @@ main() {
     validate_env
     acme_enabled && { refresh_certificate || true; }
     [ -s "$ROUTER_CONF" ] || bootstrap
+    route_reads_to_secondaries_and_replicas
     use_served_certificate
     log "TLS required on :$ROUTER_PORT (read-write) and :$((ROUTER_PORT + 1)) (read-only), routing to cluster $CLUSTER_NAME"
     acme_enabled || exec mysqlrouter -c "$ROUTER_CONF"

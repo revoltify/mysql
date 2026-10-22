@@ -25,6 +25,11 @@ validate_env() {
     [ "$BACKUP_ENABLED" = "false" ] || validate_backup_env
 }
 
+role_directives() {
+    is_read_replica || return 0
+    printf 'loose-group_replication_start_on_boot=OFF\n'
+}
+
 write_runtime_conf() {
     tuned=$(tuned_directives)
     {
@@ -33,6 +38,7 @@ write_runtime_conf() {
         printf 'report_host=%s\n' "$MYSQL_PRIVATE_IP"
         printf 'server_id=%s\n' "$(server_id_for "$MYSQL_PRIVATE_IP")"
         printf '%s\n' "$tuned"
+        role_directives
         env_directives
     } > "$RUNTIME_CONF"
     log "tuned: $(printf '%s' "$tuned" | tr '\n' ' ') overrides: $(env_directives | cut -d = -f 1 | tr '\n' ' ')"

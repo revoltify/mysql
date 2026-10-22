@@ -17,6 +17,7 @@ note() {
     log "$*"
 }
 
+server_uuid=
 own_uuid() {
     sql -e 'SELECT @@server_uuid'
 }
@@ -36,8 +37,16 @@ self_address() {
     instance_address "$MYSQL_PRIVATE_IP"
 }
 
+own_entries_on() {
+    peer_sql "$1" "SELECT COUNT(*) FROM $METADATA_SCHEMA.instances WHERE mysql_server_uuid = '$server_uuid' AND instance_type $2 '$(instance_type)'"
+}
+
 listed_by() {
-    [ "$(peer_sql "$1" "SELECT COUNT(*) FROM $METADATA_SCHEMA.instances WHERE mysql_server_uuid = '$(own_uuid)'")" = "1" ]
+    [ "$(own_entries_on "$1" '=')" = "1" ]
+}
+
+listed_in_another_role_by() {
+    [ "$(own_entries_on "$1" '<>')" = "1" ]
 }
 
 address_listed_by() {
@@ -50,19 +59,30 @@ forget_stale_entry_on() {
     cluster_shell "$1" "dba.getCluster().removeInstance('$(self_address)', {force: true})"
 }
 
-join_through() {
-    if listed_by "$1"; then
-        log "rejoining the cluster through primary $1"
-        cluster_shell "$1" "dba.getCluster().rejoinInstance('$(self_address)')"
-        return
-    fi
+add_command() {
+    is_read_replica && { printf 'addReplicaInstance'; return; }
+    printf 'addInstance'
+}
+
+rejoin_through() {
+    log "rejoining the cluster as a $CLUSTER_ROLE through primary $1"
+    cluster_shell "$1" "dba.getCluster().rejoinInstance('$(self_address)')"
+}
+
+add_through() {
+    listed_in_another_role_by "$1" && { note "ERROR: this data directory is registered in another role, CLUSTER_ROLE=$CLUSTER_ROLE needs an empty data directory"; return 0; }
     forget_stale_entry_on "$1"
-    log "joining the cluster through primary $1, cloning its data"
-    cluster_shell "$1" "dba.getCluster().addInstance('$(self_address)', {recoveryMethod: 'clone', recoveryProgress: 1})"
+    log "joining the cluster as a $CLUSTER_ROLE through primary $1, cloning its data"
+    cluster_shell "$1" "dba.getCluster().$(add_command)('$(self_address)', {recoveryMethod: 'clone', recoveryProgress: 1})"
+}
+
+join_through() {
+    listed_by "$1" && { rejoin_through "$1"; return; }
+    add_through "$1"
 }
 
 recorded_members() {
-    sql -e "SELECT SUBSTRING_INDEX(address, ':', 1) FROM $METADATA_SCHEMA.instances ORDER BY address"
+    sql -e "SELECT SUBSTRING_INDEX(address, ':', 1) FROM $METADATA_SCHEMA.instances WHERE instance_type = 'group-member' ORDER BY address"
 }
 
 gtid_executed_on() {
@@ -139,7 +159,7 @@ start_cluster_if_seed() {
     create_cluster
 }
 
-reconcile() {
+reconcile_member() {
     in_group && { outage_started_at=; note "member is $(own_state)"; return 0; }
     if primary=$(online_primary); then
         outage_started_at=
@@ -153,8 +173,35 @@ reconcile() {
     start_cluster_if_seed
 }
 
+replica_status_through() {
+    cluster_shell "$1" "var topology = dba.getCluster().status().defaultReplicaSet.topology;
+        for (var member in topology) { var replica = (topology[member].readReplicas || {})['$(self_address)']; if (replica) print(replica.status); }"
+}
+
+replicating_as_listed_replica_of() {
+    [ "$(replica_channel_state)" = "ON" ] && listed_by "$1"
+}
+
+reconcile_replica() {
+    primary=$(online_primary) || { note "no primary online, a read replica waits for the members to recover"; return 0; }
+    replicating_as_listed_replica_of "$primary" && { note "read replica is ONLINE"; return 0; }
+    status=$(replica_status_through "$primary") || return 1
+    case "$status" in
+        ONLINE | CONNECTING) note "read replica is $status" ;;
+        '') add_through "$primary" ;;
+        *) rejoin_through "$primary" ;;
+    esac
+}
+
+reconcile() {
+    mysql_alive || { note "mysqld is not accepting connections, waiting"; return 0; }
+    is_read_replica && { reconcile_replica; return; }
+    reconcile_member
+}
+
 main() {
     validate_topology_env
+    server_uuid=$(own_uuid)
     membership_recorded_on "$MYSQL_PRIVATE_IP" && sleep "$BOOT_GRACE_SECONDS"
     while true; do
         reconcile || log "ERROR: reconcile failed, retrying in ${RECONCILE_INTERVAL_SECONDS}s"

@@ -12,6 +12,7 @@
     - [Using Your Own Domain](#using-your-own-domain)
     - [Without a Domain](#without-a-domain)
     - [Read Replicas](#read-replicas)
+    - [Read-Only Nodes](#read-only-nodes)
     - [Primary Keys](#primary-keys)
 - [Managing Servers](#managing-servers)
     - [Adding Servers](#adding-servers)
@@ -193,7 +194,7 @@ Anywhere else, such as on your own machine, write the file once and point `MYSQL
 <a name="read-replicas"></a>
 ### Read Replicas
 
-Port `6447` on every server spreads read-only connections over the secondaries. To use it, open the port in your firewall and give your `mysql` connection in `config/database.php` separate read and write ports:
+Port `6447` on every server spreads read-only connections over the secondaries and any [read-only nodes](#read-only-nodes). To use it, open the port in your firewall and give your `mysql` connection in `config/database.php` separate read and write ports:
 
 ```php
 'mysql' => [
@@ -209,6 +210,20 @@ Port `6447` on every server spreads read-only connections over the secondaries. 
 ```
 
 Secondaries apply writes a moment after the primary, so keep `sticky` enabled.
+
+<a name="read-only-nodes"></a>
+### Read-Only Nodes
+
+A read-only node copies the data from the primary and then follows it with asynchronous replication. It serves reads on `6447` but never votes, never becomes the primary and is not counted when the members decide whether they still have a majority. Start it like any other server, with these lines in its `.env`:
+
+```ini
+MYSQL_PRIVATE_IP=10.104.0.9
+CLUSTER_HOSTS=10.104.0.1,10.104.0.2,10.104.0.3,10.104.0.9
+CLUSTER_ROLE=read_replica
+CLUSTER_SEED=false
+```
+
+`CLUSTER_HOSTS` lists every server, members and read-only nodes alike. `CLUSTER_ROLE` defaults to `member`, and a read-only node can never be the seed. A server keeps the role it joined with: to change it, start the server again with an empty data directory. When the primary changes, the read-only node switches to the new one by itself. If it was cut off for a while, it can take up to a minute or two. Its `node-status` reports `role=read_replica` and `state=ONLINE` while its replication channel is running.
 
 <a name="primary-keys"></a>
 ### Primary Keys
@@ -236,7 +251,7 @@ The server is installed, copies the data from the primary and joins the cluster.
 mysqlctl remove-node main mysql-04
 ```
 
-`mysqlctl` refuses to remove the current primary or to leave fewer than three servers. The removed server's data stays on disk until you delete the server.
+`mysqlctl` refuses to remove the current primary or to leave fewer than three members. Read-only nodes do not count towards that and can always be removed. The removed server's data stays on disk until you delete the server.
 
 <a name="replacing-servers"></a>
 ### Replacing Servers

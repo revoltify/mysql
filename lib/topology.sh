@@ -6,9 +6,11 @@ ADMIN_CLIENT_CONFIG=/tmp/mysql-admin.cnf
 PEER_TIMEOUT_SECONDS=3
 IPV4_PATTERN='([0-9]{1,3}\.){3}[0-9]{1,3}'
 METADATA_SCHEMA=mysql_innodb_cluster_metadata
+READ_REPLICA_CHANNEL=read_replica_replication
 
 : "${CLUSTER_NAME:=main}"
 : "${CLUSTER_SEED:=false}"
+: "${CLUSTER_ROLE:=member}"
 
 validate_topology_env() {
     require_env MYSQL_PRIVATE_IP
@@ -16,6 +18,21 @@ validate_topology_env() {
     [ -z "${CLUSTER_HOSTS:-}" ] || require_matching CLUSTER_HOSTS "$IPV4_PATTERN(,$IPV4_PATTERN)*" 'CLUSTER_HOSTS must be comma-separated IPv4 addresses without spaces'
     require_matching CLUSTER_NAME '[A-Za-z][A-Za-z0-9_]{0,39}' 'CLUSTER_NAME must start with a letter and use letters, digits and _'
     require_boolean CLUSTER_SEED
+    require_matching CLUSTER_ROLE '(member|read_replica)' 'CLUSTER_ROLE must be member or read_replica'
+    [ "$CLUSTER_ROLE" = "member" ] || [ "$CLUSTER_SEED" = "false" ] || fail 'a read_replica cannot be the CLUSTER_SEED, seed a member instead'
+}
+
+is_read_replica() {
+    [ "$CLUSTER_ROLE" = "read_replica" ]
+}
+
+instance_type() {
+    is_read_replica && { printf 'read-replica'; return; }
+    printf 'group-member'
+}
+
+replica_channel_state() {
+    sql -e "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME = '$READ_REPLICA_CHANNEL'"
 }
 
 cluster_hosts() {

@@ -40,6 +40,7 @@ COPY --chmod=755 bin/ /usr/local/bin/
 ENV MYSQL_BUFFER_POOL_PERCENT=50 \
     CLUSTER_NAME=main \
     CLUSTER_SEED=false \
+    CLUSTER_ROLE=member \
     ROUTER_PORT=6446 \
     BACKUP_ENABLED=true \
     BACKUP_INTERVAL_SECONDS=3600 \

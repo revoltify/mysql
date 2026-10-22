@@ -1009,9 +1009,26 @@ stop_node() {
     run_on "$1" 'compose down' || log "warning: could not stop $1, continuing (it may already be gone)"
 }
 
+read_replica_ips_on() {
+    sql_on "$1" "SELECT SUBSTRING_INDEX(address, ':', 1) FROM mysql_innodb_cluster_metadata.instances WHERE instance_type = 'read-replica'"
+}
+
+is_read_replica_on() {
+    grep -qx "$(private_ip_of "$1")" <<<"$(read_replica_ips_on "$2")"
+}
+
+member_count_on() {
+    grep -cvxF -f <(read_replica_ips_on "$1") <(private_ips)
+}
+
+role_on() {
+    is_read_replica_on "$1" "$2" && { printf 'read replica'; return; }
+    printf 'member'
+}
+
 forget_member() {
     local name=$1 primary=$2
-    log "$primary: removing $(instance_of "$name") and its router from the cluster metadata"
+    log "$primary: removing $(role_on "$name" "$primary") $(instance_of "$name") and its router from the cluster metadata"
     on "$primary" INSTANCE="$(instance_of "$name")" ROUTER="$(private_ip_of "$name")::$(private_ip_of "$name")" <<'EOS'
 listed() { [ "$(msql "SELECT COUNT(*) FROM mysql_innodb_cluster_metadata.instances WHERE address = '$INSTANCE'")" = 1 ]; }
 remove_listed_instance() {
@@ -1027,7 +1044,8 @@ EOS
 refuse_unsafe_removal() {
     local name=$1 primary=$2
     has_node "$name" || die "$name is not in the inventory"
-    [ $(($(node_count) - 1)) -ge 3 ] || die "refusing: removing $name would leave fewer than 3 nodes"
+    is_read_replica_on "$name" "$primary" && return 0
+    [ $(($(member_count_on "$primary") - 1)) -ge 3 ] || die "refusing: removing $name would leave fewer than 3 members"
     [ "$name" != "$primary" ] || die "refusing: $name is the primary, run failover first (or use replace-node)"
     return 0
 }
