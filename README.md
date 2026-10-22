@@ -125,6 +125,9 @@ mysqlctl env main
 
 The connection is always encrypted. Laravel's default `config/database.php` already passes `MYSQL_ATTR_SSL_CA` to PDO, so no code changes are needed.
 
+> [!WARNING]
+> Keep the `MYSQL_ATTR_SSL_CA` line. Laravel only turns on TLS when it is set, and without it every connection fails with `SSL connection error: SSL is required from client`.
+
 <a name="using-your-own-domain"></a>
 ### Using Your Own Domain
 
@@ -147,6 +150,13 @@ DB_USERNAME=laravel
 DB_PASSWORD=...
 MYSQL_ATTR_SSL_CA=/etc/ssl/certs/ca-certificates.crt
 ```
+
+`MYSQL_ATTR_SSL_CA` points at the system certificate bundle, whose location depends on where your application runs:
+
+| Where Laravel runs | `MYSQL_ATTR_SSL_CA` |
+|---|---|
+| Debian, Ubuntu or Alpine based containers (Bunny Magic Containers, Docker) | `/etc/ssl/certs/ca-certificates.crt` |
+| macOS (local development) | `/etc/ssl/cert.pem` |
 
 Certificates renew automatically. Until the first one is issued, the servers keep using their private certificate.
 
@@ -174,6 +184,8 @@ Save the certificate as a file when your application starts. On Bunny Magic Cont
 ```bash
 mkdir -p /tmp/mysql && echo "$DB_SSL_CA_B64" | base64 -d > /tmp/mysql/ca.crt
 ```
+
+Anywhere else, such as on your own machine, write the file once and point `MYSQL_ATTR_SSL_CA` at it. The certificate is also stored at `~/.mysqlctl/clusters/<cluster>-tls/ca.crt`.
 
 > [!NOTE]
 > `DB_HOST` must be one of the names you gave for TLS during `init`, because the certificate is only valid for those names.
