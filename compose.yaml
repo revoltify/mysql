@@ -14,6 +14,7 @@ services:
     <<: *node
     volumes:
       - ./data:/var/lib/mysql
+      - ./.env:/etc/node.env:ro
       - ./backup:/var/lib/mysql-backup
     stop_grace_period: 120s
     ulimits:
@@ -24,6 +25,7 @@ services:
     entrypoint: [/usr/local/bin/tini, --, router]
     volumes:
       - ./router:/router
+      - ./.env:/etc/node.env:ro
       - ./tls:/tls:ro
       - ./acme:/acme
     ulimits:
