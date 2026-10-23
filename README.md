@@ -251,7 +251,7 @@ The server is installed, copies the data from the primary and joins the cluster.
 mysqlctl remove-node main mysql-04
 ```
 
-`mysqlctl` refuses to remove the current primary or to leave fewer than three members. Read-only nodes do not count towards that and can always be removed. The removed server's data stays on disk until you delete the server.
+`mysqlctl` refuses to remove the current primary or to leave fewer than three members. Read-only nodes do not count towards that and can always be removed. The removed server's data stays on disk until you delete the server. If the server can no longer be reached, `mysqlctl` stops instead of leaving a node that could rejoin when it boots; destroy the server first, then rerun with `--force`.
 
 <a name="replacing-servers"></a>
 ### Replacing Servers

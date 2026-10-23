@@ -29,7 +29,7 @@ INVENTORY_TEXT=
 
 usage() {
     cat <<'EOF'
-usage: mysqlctl [--yes] <command> <cluster> [arguments]
+usage: mysqlctl [--yes] [--force] <command> <cluster> [arguments]
 
   init <cluster>                                   provision every node in the inventory and start the cluster
                                                    (asks for mode, servers, TLS, database and backups when no inventory exists)
@@ -301,7 +301,12 @@ set_env_key() {
     fi
     printf '%s=%s\n' "$1" "$2" >> "$file"
 }
-own_state() { msql "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid"; }
+own_state() {
+    local member
+    member=$(msql "SELECT MEMBER_STATE FROM performance_schema.replication_group_members WHERE MEMBER_ID = @@server_uuid")
+    [ -n "$member" ] && { printf '%s\n' "$member"; return; }
+    [ "$(msql "SELECT SERVICE_STATE FROM performance_schema.replication_connection_status WHERE CHANNEL_NAME = 'read_replica_replication'")" = ON ] && echo ONLINE
+}
 image_in_use() {
     docker inspect -f '{{.Config.Image}}' mysql-router-1 2>/dev/null && return
     sed -n 's/^ *image: *//p' "$MYSQL_DIR/compose.yaml" | head -n 1
@@ -319,7 +324,7 @@ remote_variables() {
 on() {
     local node=$1
     shift
-    { remote_prelude; remote_variables "$@"; cat; } | ssh_to "$node" 'bash -c "$(cat)"'
+    { remote_prelude; remote_variables "$@"; cat; } | ssh_to "$node" 'script=$(mktemp); cat > "$script"; bash "$script" </dev/null; status=$?; rm -f "$script"; exit $status'
 }
 
 run_on() {
@@ -352,10 +357,11 @@ cluster_view() {
 }
 
 agreed_primary_ip() {
-    local view seen
+    local view seen members
     view=$(cluster_view "$(view_node "${1:-}")") || return 1
     seen=$(awk '$2 != "-" { print $2 }' <<<"$view")
-    [ -n "$seen" ] && [ "$(wc -l <<<"$seen")" -ge "$(majority_of "$(node_count)")" ] || return 1
+    members=$(member_count_on "$(view_node "${1:-}")" 2>/dev/null || node_count)
+    [ -n "$seen" ] && [ "$(wc -l <<<"$seen")" -ge "$(majority_of "$members")" ] || return 1
     [ "$(sort -u <<<"$seen" | wc -l)" -eq 1 ] || return 1
     head -n 1 <<<"$seen"
 }
@@ -873,7 +879,12 @@ cmd_status() {
 }
 
 first_secondary_except() {
-    nodes_except "$1" | head -n 1
+    local replicas node
+    replicas=$(read_replica_ips_on "$1" 2>/dev/null || true)
+    for node in $(nodes_except "$1"); do
+        grep -qxF "$(private_ip_of "$node")" <<<"$replicas" || { printf '%s\n' "$node"; return 0; }
+    done
+    die "no member other than $1 can become the primary; read replicas are never promoted"
 }
 
 switch_primary_to() {
@@ -955,7 +966,7 @@ template_env_for() {
     local private=$1 template
     template=$(fetch_remote_file "$2" "$REMOTE_DIR/.env")
     [ -n "$template" ] || die "could not read $REMOTE_DIR/.env on $2"
-    env_with "$template" "MYSQL_PRIVATE_IP=$private" "CLUSTER_SEED=false" "CLUSTER_HOSTS=$(cluster_hosts_csv)"
+    env_with "$template" "MYSQL_PRIVATE_IP=$private" "CLUSTER_SEED=false" "CLUSTER_HOSTS=$(cluster_hosts_csv)" "CLUSTER_ROLE=${3:-member}"
 }
 
 validate_new_node() {
@@ -974,9 +985,9 @@ plan_add_node() {
 }
 
 add_node() {
-    local name=$1 address=$2 template=$3 env_content
+    local name=$1 address=$2 template=$3 role=${4:-member} env_content
     NODES="$NODES $name=$address"
-    env_content=$(template_env_for "${address#*/}" "$template")
+    env_content=$(template_env_for "${address#*/}" "$template" "$role")
     provision "$name" "$env_content"
     copy_server_cert "$template" "$name"
     start_node "$name"
@@ -1006,7 +1017,9 @@ cmd_add_node() {
 
 stop_node() {
     log "$1: docker compose down (the data directory is kept)"
-    run_on "$1" 'compose down' || log "warning: could not stop $1, continuing (it may already be gone)"
+    run_on "$1" 'compose down' && return 0
+    [ "${FORCE:-}" = true ] || die "could not stop $1; rerun with --force only if the server is destroyed, otherwise it can rejoin the cluster when it boots"
+    log "warning: could not stop $1, removing it anyway because of --force; destroy the server so it cannot rejoin"
 }
 
 read_replica_ips_on() {
@@ -1097,14 +1110,15 @@ cmd_replace_node() {
     NODES="$NODES $name=$address"
     require_reachable "$name"
     NODES=$(nodes_without "$name")
-    local template=$primary plan=() line
+    local template=$primary plan=() line role=member
+    is_read_replica_on "$old" "$primary" && role=read_replica
     [ "$old" = "$primary" ] && template=$(first_secondary_except "$old") && plan+=("switch the primary away from $old to $template")
     while IFS= read -r line; do plan+=("$line"); done < <(plan_add_node "$name" "$address" "$template")
     while IFS= read -r line; do plan+=("$line"); done < <(plan_remove_node "$old")
     confirm "${plan[@]}"
     lock_cluster
     [ "$old" != "$primary" ] || switch_primary_to "$template" "$old"
-    add_node "$name" "$address" "$template"
+    add_node "$name" "$address" "$template" "$role"
     remove_node "$old" "$(primary_node "$old")"
     show_status
 }
@@ -1112,6 +1126,7 @@ cmd_replace_node() {
 issue_server_cert_on() {
     on "$1" IMAGE="$(image_with_tag)" NAMES="$(certificate_names)" CA_CRT="$(cat "$TLS_LOCAL_DIR/ca.crt")" CA_KEY="$(cat "$TLS_LOCAL_DIR/ca.key")" <<'EOS'
 work=/root/mysqlctl-certs
+trap 'rm -f "$work/ca.key" "$work/ca.srl"' EXIT
 rm -rf "$work"
 install -d -m 700 "$work"
 write_file "$work/ca.crt" 644 "$CA_CRT"
@@ -1440,6 +1455,7 @@ main() {
     for argument in "$@"; do
         case "$argument" in
             -y | --yes) YES=true ;;
+            -f | --force) FORCE=true ;;
             *) arguments+=("$argument") ;;
         esac
     done
